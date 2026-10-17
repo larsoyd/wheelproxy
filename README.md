@@ -75,7 +75,8 @@ package contains a Chromium build, and that browser is selected, every `Exec=` l
 with `/usr/bin/wheelproxy-launch`. A browser counts as Chromium-based when its desktop entry declares it a web
 browser and one of its package's executables knows Chromium's `disable-smooth-scrolling` switch, so Firefox
 and Electron apps are left alone. Package updates replace the entry and the hook routes it again. Removing the
-package restores the entries.
+package restores the entries. Because the entries are edited in place, `pacman -Qkk` reports each routed
+entry as an altered file of its browser package.
 
 Start the proxy once with `systemctl --user start wheelproxy.service` (it starts by itself from the next
 login), then quit the browser and open it from the application menu.
