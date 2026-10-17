@@ -1,0 +1,421 @@
+import array
+import os
+import signal
+import socket
+import struct
+import subprocess
+import tempfile
+import threading
+import time
+import unittest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+BIN = os.path.join(ROOT, "build", "wheelproxy")
+
+POINTER = 4
+WHEEL, FINGER = 0, 1
+VERTICAL, HORIZONTAL = 0, 1
+
+
+def msg(obj, op, *args):
+    body = b""
+    for a in args:
+        if isinstance(a, str):
+            s = a.encode() + b"\0"
+            body += struct.pack("<I", len(s)) + s + b"\0" * (-len(s) % 4)
+        else:
+            body += struct.pack("<i" if a < 0 else "<I", a)
+    return struct.pack("<II", obj, (8 + len(body)) << 16 | op) + body
+
+
+def parse(data):
+    out = []
+    while len(data) >= 8:
+        obj, word = struct.unpack_from("<II", data)
+        size = word >> 16
+        out.append((obj, word & 0xFFFF, data[8:size]))
+        data = data[size:]
+    return out
+
+
+def wheel_frame(n, axis=VERTICAL, source=WHEEL):
+    return (msg(POINTER, 6, source) + msg(POINTER, 9, axis, n)
+            + msg(POINTER, 4, 1000, axis, n * 256 // 8) + msg(POINTER, 5))
+
+
+def send_fds(sock, data, fds):
+    sock.sendmsg([data], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", fds))])
+
+
+def recv_fds(sock, size=65536):
+    fds = array.array("i")
+    data, anc, _, _ = sock.recvmsg(size, socket.CMSG_SPACE(28 * fds.itemsize))
+    for level, kind, payload in anc:
+        if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
+            fds.frombytes(payload[: len(payload) - len(payload) % fds.itemsize])
+    return data, list(fds)
+
+
+def read_for(sock, seconds, quiet=None):
+    sock.settimeout(0.005)
+    end = time.monotonic() + seconds
+    last = time.monotonic()
+    chunks = []
+    while time.monotonic() < end:
+        try:
+            data = sock.recv(65536)
+        except socket.timeout:
+            if quiet and chunks and time.monotonic() - last > quiet:
+                break
+            continue
+        if not data:
+            break
+        chunks.append((time.monotonic(), data))
+        last = time.monotonic()
+    return chunks
+
+
+def read_exact(sock, size, seconds=5):
+    sock.settimeout(seconds)
+    buf = b""
+    while len(buf) < size:
+        data = sock.recv(size - len(buf))
+        if not data:
+            break
+        buf += data
+    return buf
+
+
+def timed_events(chunks):
+    events = []
+    pending = b""
+    for t, data in chunks:
+        pending += data
+        for obj, op, body in parse(pending):
+            events.append((t, obj, op, body))
+            pending = pending[8 + len(body):]
+    return events
+
+
+def v120_values(events, obj=POINTER):
+    return [struct.unpack_from("<Ii", b)[1] for _, o, op, b in events if o == obj and op == 9]
+
+
+class Proxy(unittest.TestCase):
+    args = ["--mult", "2", "--tau-ms", "30", "--tick-ms", "4"]
+    upstream_name = "wayland-up"
+    seat_version = 9
+
+    @classmethod
+    def setUpClass(cls):
+        res = subprocess.run(["make", "-C", ROOT], capture_output=True, text=True, timeout=120)
+        if res.returncode:
+            raise AssertionError("build failed: " + res.stdout + res.stderr)
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wp")
+        self.upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.upstream.bind(os.path.join(self.tmp, "wayland-up"))
+        self.upstream.listen(4)
+        self.log = open(os.path.join(self.tmp, "log"), "w+")
+        env = dict(os.environ, XDG_RUNTIME_DIR=self.tmp)
+        cmd = [BIN, "--listen", "wayland-px", "--upstream", self.upstream_name] + self.args
+        self.proc = subprocess.Popen(cmd, env=env, stderr=self.log, start_new_session=True)
+        path = os.path.join(self.tmp, "wayland-px")
+        for _ in range(500):
+            if os.path.exists(path):
+                break
+            time.sleep(0.01)
+        else:
+            self.fail("proxy socket never appeared log=" + self.logtext())
+        self.client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.client.connect(path)
+        self.server = None
+        if self.upstream_name == "wayland-up":
+            self.upstream.settimeout(5)
+            self.server, _ = self.upstream.accept()
+            self.handshake()
+
+    def tearDown(self):
+        if self.proc.poll() is None:
+            os.killpg(self.proc.pid, signal.SIGTERM)
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                os.killpg(self.proc.pid, signal.SIGKILL)
+                self.proc.wait(timeout=5)
+        for s in (self.client, self.server, self.upstream):
+            if s:
+                s.close()
+        self.log.close()
+
+    def logtext(self):
+        self.log.flush()
+        self.log.seek(0)
+        return self.log.read()
+
+    def handshake(self):
+        setup = msg(1, 1, 2) + msg(2, 0, 7, "wl_seat", self.seat_version, 3) + msg(3, 0, POINTER)
+        self.client.sendall(setup)
+        self.assertEqual(setup, read_exact(self.server, len(setup)))
+
+    def events_after(self, data, seconds=1.0, quiet=0.15):
+        self.server.sendall(data)
+        return timed_events(read_for(self.client, seconds, quiet))
+
+
+class Passthrough(Proxy):
+    def test_request_fd_reaches_compositor(self):
+        r, w = os.pipe()
+        send_fds(self.client, msg(5, 0, 1), [w])
+        os.close(w)
+        self.server.settimeout(5)
+        data, fds = recv_fds(self.server)
+        self.assertEqual(msg(5, 0, 1), data)
+        self.assertEqual(1, len(fds))
+        os.write(fds[0], b"ok")
+        os.close(fds[0])
+        self.assertEqual(b"ok", os.read(r, 2))
+        os.close(r)
+
+    def test_event_fd_reaches_client(self):
+        r, w = os.pipe()
+        send_fds(self.server, msg(9, 3, 7), [w])
+        os.close(w)
+        self.client.settimeout(5)
+        data, fds = recv_fds(self.client)
+        self.assertEqual(msg(9, 3, 7), data)
+        os.write(fds[0], b"hi")
+        os.close(fds[0])
+        self.assertEqual(b"hi", os.read(r, 2))
+        os.close(r)
+
+    def test_large_burst_both_ways_is_byte_exact(self):
+        down = b"".join(msg(1000 + i % 50, i % 7, i, "x" * (i % 40)) for i in range(4000))
+        up = b"".join(msg(2000 + i % 50, i % 5, i) for i in range(4000))
+        self.server.sendall(down)
+        self.client.sendall(up)
+        time.sleep(0.2)
+        self.assertEqual(up, read_exact(self.server, len(up)))
+        self.assertEqual(down, read_exact(self.client, len(down)))
+
+    def test_finger_scroll_is_untouched(self):
+        frame = msg(POINTER, 6, FINGER) + msg(POINTER, 4, 5, VERTICAL, 2560) + msg(POINTER, 5)
+        self.server.sendall(frame)
+        self.assertEqual(frame, read_exact(self.client, len(frame)))
+        self.assertEqual([], read_for(self.client, 0.1))
+
+    def test_horizontal_wheel_is_untouched(self):
+        frame = wheel_frame(120, axis=HORIZONTAL)
+        self.server.sendall(frame)
+        self.assertEqual(frame, read_exact(self.client, len(frame)))
+        self.assertEqual([], read_for(self.client, 0.1))
+
+    def test_value120_on_other_object_is_untouched(self):
+        ev = msg(3, 9, VERTICAL, 120)
+        self.server.sendall(ev)
+        self.assertEqual(ev, read_exact(self.client, len(ev)))
+
+    def test_deleted_pointer_id_is_untracked(self):
+        self.server.sendall(msg(1, 1, POINTER))
+        self.assertEqual(msg(1, 1, POINTER), read_exact(self.client, 12))
+        rebind = msg(2, 0, 8, "wl_output", 4, POINTER)
+        self.client.sendall(rebind)
+        self.assertEqual(rebind, read_exact(self.server, len(rebind)))
+        frame = wheel_frame(120)
+        self.server.sendall(frame)
+        self.assertEqual(frame, read_exact(self.client, len(frame)))
+
+
+    def test_only_wl_seat_binds_are_seats(self):
+        bind = msg(2, 0, 9, "wl_output", 9, 20) + msg(20, 0, 51)
+        self.client.sendall(bind)
+        self.assertEqual(bind, read_exact(self.server, len(bind)))
+        frame = msg(51, 9, VERTICAL, 120) + msg(51, 5)
+        self.server.sendall(frame)
+        self.assertEqual(frame, read_exact(self.client, len(frame)))
+
+
+class OldSeat(Proxy):
+    seat_version = 7
+
+    def test_pointer_below_v8_is_untouched(self):
+        frame = wheel_frame(120)
+        self.server.sendall(frame)
+        self.assertEqual(frame, read_exact(self.client, len(frame)))
+        self.assertEqual([], read_for(self.client, 0.1))
+
+
+class Smoothing(Proxy):
+    def test_notch_is_scaled_and_spread_over_frames(self):
+        sent = time.monotonic()
+        events = self.events_after(wheel_frame(90))
+        values = v120_values(events)
+        self.assertEqual(180, sum(values), "values=%r" % values)
+        self.assertGreaterEqual(len(values), 5, "values=%r" % values)
+        first = next(t for t, o, op, _ in events if o == POINTER and op == 9)
+        self.assertLess(first - sent, 0.02)
+        last = max(t for t, o, op, _ in events if o == POINTER and op == 9)
+        self.assertLess(last - sent, 0.6)
+
+    def test_first_step_is_sent_with_the_original_frame(self):
+        self.server.sendall(wheel_frame(120))
+        chunks = read_for(self.client, 0.5, quiet=0.15)
+        first = [op for o, op, _ in parse(chunks[0][1]) if o == POINTER]
+        self.assertIn(9, first, "first=%r" % first)
+
+    def test_reused_seat_id_is_not_a_seat(self):
+        self.server.sendall(msg(1, 1, 3))
+        self.assertEqual(msg(1, 1, 3), read_exact(self.client, 12))
+        reuse = msg(10, 0, 3) + msg(3, 0, 50)
+        self.client.sendall(reuse)
+        self.assertEqual(reuse, read_exact(self.server, len(reuse)))
+        frame = (msg(50, 6, WHEEL) + msg(50, 9, VERTICAL, 120)
+                 + msg(50, 4, 1, VERTICAL, 3840) + msg(50, 5))
+        self.server.sendall(frame)
+        self.assertEqual(frame, read_exact(self.client, len(frame)))
+
+    def test_steps_are_front_loaded(self):
+        values = v120_values(self.events_after(wheel_frame(120)))
+        self.assertEqual(values[0], max(values), "values=%r" % values)
+        for a, b in zip(values, values[1:]):
+            self.assertLessEqual(b, a + 1, "values=%r" % values)
+
+    def test_every_step_is_a_complete_frame_with_timestamp(self):
+        events = [(o, op, b) for _, o, op, b in self.events_after(wheel_frame(120)) if o == POINTER]
+        steps = 0
+        last_time = 1000
+        for i, (o, op, b) in enumerate(events):
+            if op != 9:
+                continue
+            steps += 1
+            rest = [e[1] for e in events[i + 1:]]
+            self.assertEqual(4, rest[0], "events=%r" % events)
+            n = struct.unpack_from("<Ii", b)[1]
+            when, axis, value = struct.unpack_from("<IIi", events[i + 1][2])
+            self.assertEqual(VERTICAL, axis)
+            self.assertEqual(n * 32, value, "a v120 step of %d is %d/8 of a 15 unit detent" % (n, n))
+            self.assertGreaterEqual(when, last_time)
+            last_time = when
+            self.assertEqual(5, rest[1], "events=%r" % events)
+        self.assertGreater(steps, 0)
+        self.assertGreater(last_time, 1000)
+
+    def test_original_vertical_events_are_absorbed(self):
+        ops = [op for _, o, op, _ in self.events_after(wheel_frame(120)) if o == POINTER]
+        self.assertNotIn(9, ops[: ops.index(5)], "ops=%r" % ops)
+        self.assertNotIn(4, ops[: ops.index(5)], "ops=%r" % ops)
+
+    def test_consecutive_notches_accumulate(self):
+        self.server.sendall(wheel_frame(90))
+        time.sleep(0.01)
+        values = v120_values(self.events_after(wheel_frame(90)))
+        self.assertEqual(360, sum(values), "values=%r" % values)
+
+    def test_split_message_is_reassembled(self):
+        frame = wheel_frame(120)
+        self.server.sendall(frame[:22])
+        time.sleep(0.03)
+        values = v120_values(self.events_after(frame[22:]))
+        self.assertEqual(240, sum(values), "values=%r" % values)
+
+    def test_reversal_drops_the_rest(self):
+        self.server.sendall(wheel_frame(120))
+        early = timed_events(read_for(self.client, 0.02))
+        values = v120_values(early) + v120_values(self.events_after(wheel_frame(-120)))
+        neg = [v for v in values if v < 0]
+        self.assertEqual(-240, sum(neg), "values=%r" % values)
+        first_neg = values.index(neg[0])
+        self.assertTrue(all(v < 0 for v in values[first_neg:]), "values=%r" % values)
+        self.assertLess(sum(v for v in values if v > 0), 240, "values=%r" % values)
+
+    def test_leave_stops_scrolling(self):
+        self.server.sendall(wheel_frame(120))
+        early = timed_events(read_for(self.client, 0.012))
+        events = early + self.events_after(msg(POINTER, 1, 9, 77) + msg(POINTER, 5))
+        ops = [(op, b) for _, o, op, b in events if o == POINTER]
+        leave = ops.index((1, struct.pack("<II", 9, 77)))
+        self.assertNotIn(9, [op for op, _ in ops[leave:]], "ops=%r" % ops)
+        self.assertLess(sum(v120_values(events)), 240)
+
+
+class Verbose(Proxy):
+    args = Proxy.args + ["--verbose"]
+
+    def test_animation_settles_and_logs_it(self):
+        self.events_after(wheel_frame(90))
+        deadline = time.monotonic() + 1
+        while "[wheel] settled" not in self.logtext() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        log = self.logtext()
+        self.assertIn("[wheel] pointer=4 v120=90 remaining=180.0", log)
+        self.assertIn("[wheel] settled pointer=4", log, "log=" + log)
+
+
+    def test_timer_stops_after_settling(self):
+        self.events_after(wheel_frame(90))
+        time.sleep(0.6)
+        before = self.switches()
+        time.sleep(0.5)
+        self.assertLess(self.switches() - before, 10)
+
+    def switches(self):
+        with open("/proc/%d/status" % self.proc.pid) as f:
+            return int(next(l for l in f if l.startswith("voluntary_ctxt_switches")).split()[1])
+
+
+class Backpressure(Proxy):
+    def stall(self, src, dst):
+        block = b"".join(msg(1000, 1, i, "y" * 200) for i in range(256))
+        reps = (48 << 20) // len(block)
+        sender = threading.Thread(target=lambda: [src.sendall(block) for _ in range(reps)])
+        sender.start()
+        time.sleep(0.5)
+        with open("/proc/%d/status" % self.proc.pid) as f:
+            hwm = int(next(l for l in f if l.startswith("VmHWM")).split()[1])
+        got = read_exact(dst, reps * len(block), seconds=20)
+        sender.join(timeout=20)
+        self.assertFalse(sender.is_alive())
+        self.assertEqual(block * reps, got)
+        self.assertLess(hwm, 24 << 10, "proxy peak rss kb=%d while reader stalled" % hwm)
+
+    def test_stalled_client_does_not_grow_the_proxy(self):
+        self.stall(self.server, self.client)
+
+    def test_stalled_compositor_does_not_grow_the_proxy(self):
+        self.stall(self.client, self.server)
+
+
+class Slower(Proxy):
+    args = ["--mult", "1", "--tau-ms", "80", "--tick-ms", "8"]
+
+    def test_parameters_change_the_curve(self):
+        sent = time.monotonic()
+        events = self.events_after(wheel_frame(120), seconds=1.5, quiet=0.3)
+        values = v120_values(events)
+        self.assertEqual(120, sum(values), "values=%r" % values)
+        last = max(t for t, o, op, _ in events if o == POINTER and op == 9)
+        self.assertGreater(last - sent, 0.15)
+
+
+class MissingUpstream(Proxy):
+    upstream_name = "wayland-gone"
+
+    def test_client_is_refused_with_reason(self):
+        self.client.settimeout(5)
+        self.assertEqual(b"", self.client.recv(16))
+        log = self.logtext()
+        self.assertIn("[conn] refused reason=upstream_connect", log)
+        self.assertIn("wayland-gone", log)
+
+
+class Arguments(unittest.TestCase):
+    def test_bad_number_is_refused(self):
+        res = subprocess.run([BIN, "--mult", "abc"], capture_output=True, text=True, timeout=10)
+        self.assertEqual(2, res.returncode)
+        self.assertIn("[args] refused", res.stderr)
+        self.assertIn("--mult", res.stderr)
+
+
+if __name__ == "__main__":
+    unittest.main()
