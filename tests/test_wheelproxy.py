@@ -1,5 +1,7 @@
 import array
 import os
+import resource
+import shutil
 import signal
 import socket
 import struct
@@ -15,6 +17,9 @@ BIN = os.path.join(ROOT, "build", "wheelproxy")
 POINTER = 4
 WHEEL, FINGER = 0, 1
 VERTICAL, HORIZONTAL = 0, 1
+
+
+STRACE = ["strace", "-f", "-qq", "-o", "/dev/null"]
 
 
 def msg(obj, op, *args):
@@ -101,16 +106,21 @@ def v120_values(events, obj=POINTER):
     return [struct.unpack_from("<Ii", b)[1] for _, o, op, b in events if o == obj and op == 9]
 
 
+def build():
+    res = subprocess.run(["make", "-C", ROOT], capture_output=True, text=True, timeout=120)
+    if res.returncode:
+        raise AssertionError("build failed: " + res.stdout + res.stderr)
+
+
 class Proxy(unittest.TestCase):
     args = ["--mult", "2", "--tau-ms", "30", "--tick-ms", "4"]
     upstream_name = "wayland-up"
     seat_version = 9
+    lazy = False
 
     @classmethod
     def setUpClass(cls):
-        res = subprocess.run(["make", "-C", ROOT], capture_output=True, text=True, timeout=120)
-        if res.returncode:
-            raise AssertionError("build failed: " + res.stdout + res.stderr)
+        build()
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="wp")
@@ -118,46 +128,84 @@ class Proxy(unittest.TestCase):
         self.upstream.bind(os.path.join(self.tmp, "wayland-up"))
         self.upstream.listen(4)
         self.log = open(os.path.join(self.tmp, "log"), "w+")
+        self.proc = None
+        self.socks = []
+        self.client = self.server = None
+        if self.lazy:
+            return
+        self.start()
+        self.client = self.dial()
+        if self.upstream_name == "wayland-up":
+            self.server = self.accept()
+            self.handshake(self.client, self.server)
+
+    def tearDown(self):
+        self.stop()
+        for s in self.socks + [self.upstream]:
+            s.close()
+        self.log.close()
+
+    def start(self, wrap=()):
         env = dict(os.environ, XDG_RUNTIME_DIR=self.tmp)
-        cmd = [BIN, "--listen", "wayland-px", "--upstream", self.upstream_name] + self.args
+        cmd = [*wrap, BIN, "--listen", "wayland-px", "--upstream", self.upstream_name] + self.args
         self.proc = subprocess.Popen(cmd, env=env, stderr=self.log, start_new_session=True)
         path = os.path.join(self.tmp, "wayland-px")
         for _ in range(500):
             if os.path.exists(path):
-                break
+                return
             time.sleep(0.01)
-        else:
-            self.fail("proxy socket never appeared log=" + self.logtext())
-        self.client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        self.client.connect(path)
-        self.server = None
-        if self.upstream_name == "wayland-up":
-            self.upstream.settimeout(5)
-            self.server, _ = self.upstream.accept()
-            self.handshake()
+        self.fail("proxy socket never appeared log=" + self.logtext())
 
-    def tearDown(self):
-        if self.proc.poll() is None:
+    def stop(self):
+        if self.proc and self.proc.poll() is None:
             os.killpg(self.proc.pid, signal.SIGTERM)
             try:
                 self.proc.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 os.killpg(self.proc.pid, signal.SIGKILL)
                 self.proc.wait(timeout=5)
-        for s in (self.client, self.server, self.upstream):
-            if s:
-                s.close()
-        self.log.close()
+        path = os.path.join(self.tmp, "wayland-px")
+        if os.path.exists(path):
+            os.unlink(path)
+
+    def dial(self):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.socks.append(s)
+        s.connect(os.path.join(self.tmp, "wayland-px"))
+        return s
+
+    def accept(self):
+        self.upstream.settimeout(5)
+        s, _ = self.upstream.accept()
+        self.socks.append(s)
+        return s
 
     def logtext(self):
         self.log.flush()
         self.log.seek(0)
         return self.log.read()
 
-    def handshake(self):
+    def wait_log(self, text, seconds=3):
+        deadline = time.monotonic() + seconds
+        while text not in self.logtext() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        self.assertIn(text, self.logtext())
+
+    def closed(self, sock, seconds=3):
+        sock.settimeout(seconds)
+        try:
+            while sock.recv(65536):
+                pass
+        except socket.timeout:
+            return False
+        except ConnectionResetError:
+            pass
+        return True
+
+    def handshake(self, client, server):
         setup = msg(1, 1, 2) + msg(2, 0, 7, "wl_seat", self.seat_version, 3) + msg(3, 0, POINTER)
-        self.client.sendall(setup)
-        self.assertEqual(setup, read_exact(self.server, len(setup)))
+        client.sendall(setup)
+        self.assertEqual(setup, read_exact(server, len(setup)), "log=" + self.logtext())
 
     def events_after(self, data, seconds=1.0, quiet=0.15):
         self.server.sendall(data)
@@ -189,6 +237,14 @@ class Passthrough(Proxy):
         os.close(fds[0])
         self.assertEqual(b"hi", os.read(r, 2))
         os.close(r)
+
+    def test_more_fds_than_a_message_carries_is_refused(self):
+        r, w = os.pipe()
+        send_fds(self.client, msg(5, 0, 1), [w] * 40)
+        os.close(w)
+        os.close(r)
+        self.assertTrue(self.closed(self.client), "log=" + self.logtext())
+        self.assertIn("[conn] close id=1 reason=fd_truncated", self.logtext())
 
     def test_large_burst_both_ways_is_byte_exact(self):
         down = b"".join(msg(1000 + i % 50, i % 7, i, "x" * (i % 40)) for i in range(4000))
@@ -234,6 +290,63 @@ class Passthrough(Proxy):
         frame = msg(51, 9, VERTICAL, 120) + msg(51, 5)
         self.server.sendall(frame)
         self.assertEqual(frame, read_exact(self.client, len(frame)))
+
+
+class Lifecycle(Proxy):
+    def test_start_line_names_the_pid(self):
+        self.wait_log("[wheelproxy] start pid=%d " % self.proc.pid)
+
+    def test_hangup_close_line_has_errno_age_and_queues(self):
+        self.client.close()
+        self.wait_log("[conn] close id=1 reason=client_hangup errno=none ms=")
+        log = self.logtext()
+        self.assertIn("queued_up=0 queued_down=0 fds_up=0 fds_down=0", log)
+        self.assertLess(int(log.split(" ms=")[1].split()[0]), 5000, log)
+
+    def test_sigterm_logs_why_it_stopped(self):
+        os.kill(self.proc.pid, signal.SIGTERM)
+        self.assertEqual(0, self.proc.wait(timeout=5))
+        log = self.logtext()
+        self.assertIn("[conn] close id=1 reason=shutdown errno=none", log)
+        self.assertIn("[wheelproxy] stop reason=SIGTERM served=1", log)
+
+
+class Debug(Proxy):
+    def test_usr1_dumps_connection_state(self):
+        os.kill(self.proc.pid, signal.SIGUSR1)
+        self.wait_log("[state] conns=1 served=1")
+        log = self.logtext()
+        self.assertIn("queued_up=0 queued_down=0 fds_up=0 fds_down=0 pointers=1 ticking=0", log)
+        self.assertIn("[state] conn id=1 ms=", log)
+        self.assertIn("[state] pointer id=1 pointer=4 version=9 remaining=0.0 notches=0", log)
+        self.client.sendall(msg(5, 0, 1))
+        self.assertEqual(msg(5, 0, 1), read_exact(self.server, 12))
+
+    def test_pointer_past_the_limit_is_logged(self):
+        reqs = b"".join(msg(3, 0, 60 + i) for i in range(8))
+        self.client.sendall(reqs)
+        self.assertEqual(reqs, read_exact(self.server, len(reqs)))
+        self.wait_log("[seat] untracked id=1 seat=3 pointer=67 reason=pointer_limit max=8")
+
+    def test_malformed_bind_is_logged(self):
+        for length in (0, 1000, 0xFFFFFFFD):
+            bad = msg(2, 0, 7, length, 9, 30)
+            self.client.sendall(bad)
+            self.assertEqual(bad, read_exact(self.server, len(bad)))
+            self.wait_log("[proto] warn id=1 reason=bad_bind len=%d size=24" % length)
+
+    def test_huge_object_id_is_refused(self):
+        self.client.sendall(msg(1, 1, 1 << 23))
+        self.assertTrue(self.closed(self.client), "log=" + self.logtext())
+        log = self.logtext()
+        self.assertIn("[proto] error id=1 reason=id_range obj=8388608 max=4194303", log)
+        self.assertIn("[conn] close id=1 reason=id_range", log)
+
+    def test_largest_allowed_id_is_tracked(self):
+        bind = msg(2, 0, 7, "wl_seat", 9, (1 << 22) - 1)
+        self.client.sendall(bind)
+        self.assertEqual(bind, read_exact(self.server, len(bind)))
+        self.assertNotIn("id_range", self.logtext())
 
 
 class OldSeat(Proxy):
@@ -352,6 +465,13 @@ class Verbose(Proxy):
         self.assertIn("[wheel] settled pointer=4", log, "log=" + log)
 
 
+    def test_seat_and_pointer_tracking_is_logged(self):
+        self.wait_log("[seat] bind id=1 seat=3 version=9")
+        self.assertIn("[pointer] track id=1 pointer=4 version=9", self.logtext())
+        self.server.sendall(msg(1, 1, POINTER))
+        self.assertEqual(msg(1, 1, POINTER), read_exact(self.client, 12))
+        self.wait_log("[pointer] drop id=1 pointer=4")
+
     def test_timer_stops_after_settling(self):
         self.events_after(wheel_frame(90))
         time.sleep(0.6)
@@ -378,6 +498,30 @@ class Backpressure(Proxy):
         self.assertFalse(sender.is_alive())
         self.assertEqual(block * reps, got)
         self.assertLess(hwm, 24 << 10, "proxy peak rss kb=%d while reader stalled" % hwm)
+
+    def test_fds_queued_behind_a_stalled_client_all_arrive(self):
+        filler = b"".join(msg(1000, 1, i, "z" * 200) for i in range(1500))
+        self.server.sendall(filler)
+        time.sleep(0.2)
+        r, w = os.pipe()
+        for i in range(10):
+            send_fds(self.server, msg(9, 3, i), [w] * 25)
+            time.sleep(0.01)
+        os.close(w)
+        expect = filler + b"".join(msg(9, 3, i) for i in range(10))
+        got, fds = b"", 0
+        self.client.settimeout(5)
+        while len(got) < len(expect):
+            data, received = recv_fds(self.client)
+            if not data:
+                break
+            got += data
+            fds += len(received)
+            for fd in received:
+                os.close(fd)
+        os.close(r)
+        self.assertEqual(expect, got)
+        self.assertEqual(250, fds, "fds delivered with the data log=" + self.logtext())
 
     def test_stalled_client_does_not_grow_the_proxy(self):
         self.stall(self.server, self.client)
@@ -456,16 +600,258 @@ class MissingUpstream(Proxy):
         self.client.settimeout(5)
         self.assertEqual(b"", self.client.recv(16))
         log = self.logtext()
-        self.assertIn("[conn] refused reason=upstream_connect", log)
+        self.assertIn("[conn] refused id=1 reason=upstream_connect errno=ENOENT", log)
         self.assertIn("wayland-gone", log)
 
 
+def cpu_seconds(pid):
+    with open("/proc/%d/stat" % pid) as f:
+        fields = f.read().rsplit(")", 1)[1].split()
+    return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+
+
+class FdLimit(Proxy):
+    def test_exhausted_fds_refuse_the_client_without_spinning(self):
+        pid = self.proc.pid
+        used = len(os.listdir("/proc/%d/fd" % pid))
+        soft, hard = resource.prlimit(pid, resource.RLIMIT_NOFILE)
+        resource.prlimit(pid, resource.RLIMIT_NOFILE, (used, hard))
+        late = self.dial()
+        time.sleep(0.3)
+        before = cpu_seconds(pid)
+        time.sleep(0.5)
+        burned = cpu_seconds(pid) - before
+        self.assertLess(burned, 0.1, "cpu seconds in 0.5 s while out of fds=%.2f" % burned)
+        self.assertTrue(self.closed(late), "client left waiting log=" + self.logtext())
+        self.assertIn("[conn] refused reason=accept errno=EMFILE", self.logtext())
+        resource.prlimit(pid, resource.RLIMIT_NOFILE, (soft, hard))
+        self.handshake(self.dial(), self.accept())
+
+
+class MemoryLimit(Proxy):
+    def test_failed_allocation_refuses_the_client(self):
+        pid = self.proc.pid
+        with open("/proc/%d/status" % pid) as f:
+            vm = int(next(l for l in f if l.startswith("VmSize")).split()[1]) * 1024
+        resource.prlimit(pid, resource.RLIMIT_AS, (vm + (64 << 10), resource.RLIM_INFINITY))
+        late = self.dial()
+        self.assertTrue(self.closed(late), "log=" + self.logtext())
+        resource.prlimit(pid, resource.RLIMIT_AS, (resource.RLIM_INFINITY, resource.RLIM_INFINITY))
+        self.wait_log("[conn] refused reason=out_of_memory")
+        self.client.sendall(msg(5, 0, 1))
+        self.assertEqual(msg(5, 0, 1), read_exact(self.server, 12))
+
+
+class FullBacklog(Proxy):
+    def test_full_compositor_backlog_does_not_stall_other_clients(self):
+        path = os.path.join(self.tmp, "wayland-up")
+        for _ in range(64):
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            self.socks.append(s)
+            s.setblocking(False)
+            try:
+                s.connect(path)
+            except BlockingIOError:
+                break
+        else:
+            self.fail("compositor backlog never filled")
+        late = self.dial()
+        time.sleep(0.1)
+        self.client.sendall(msg(5, 0, 1))
+        try:
+            got = read_exact(self.server, 12, seconds=2)
+        except socket.timeout:
+            got = b""
+        self.assertEqual(msg(5, 0, 1), got, "proxy stalled log=" + self.logtext())
+        self.assertTrue(self.closed(late))
+        self.assertIn("reason=upstream_connect errno=EAGAIN", self.logtext())
+
+
+class Faults(Proxy):
+    lazy = True
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        if not shutil.which("strace"):
+            raise AssertionError("strace is required for the fault injection tests")
+
+    def inject(self, *spec):
+        self.start(STRACE + list(spec))
+
+    def attached(self):
+        client, server = self.dial(), self.accept()
+        self.handshake(client, server)
+        return client, server
+
+    def assert_refused(self, client, line):
+        self.assertTrue(self.closed(client), "client left open log=" + self.logtext())
+        self.wait_log(line)
+
+    def test_accept_error_is_logged_and_retried(self):
+        self.inject("--inject=accept4:error=ECONNABORTED:when=1")
+        self.attached()
+        self.assertIn("[conn] refused reason=accept errno=ECONNABORTED", self.logtext())
+
+    def test_timerfd_failure_refuses_the_client(self):
+        self.inject("--inject=timerfd_create:error=EMFILE:when=1")
+        self.assert_refused(self.dial(), "[conn] refused id=1 reason=timerfd errno=EMFILE")
+        self.attached()
+
+    def test_upstream_socket_failure_refuses_the_client(self):
+        self.inject("--inject=socket:error=EMFILE:when=2")
+        self.assert_refused(self.dial(), "[conn] refused id=1 reason=upstream_connect errno=EMFILE")
+        self.attached()
+
+    def test_epoll_add_failure_refuses_the_client(self):
+        for when in (3, 4, 5):
+            with self.subTest(when=when):
+                self.stop()
+                self.inject("--inject=epoll_ctl:error=ENOSPC:when=%d" % when)
+                self.assert_refused(self.dial(), "reason=epoll_add errno=ENOSPC")
+                self.attached()
+
+    def test_epoll_mod_failure_closes_the_connection(self):
+        self.inject("--inject=epoll_ctl:error=ENOMEM:when=6")
+        client, server = self.dial(), self.accept()
+        client.sendall(msg(1, 1, 2))
+        self.assert_refused(client, "[conn] close id=1 reason=epoll_mod errno=ENOMEM")
+
+    def test_timer_arm_failure_closes_the_connection(self):
+        self.inject("--inject=timerfd_settime:error=EINVAL:when=1")
+        client, server = self.attached()
+        server.sendall(wheel_frame(120))
+        self.assert_refused(client, "[conn] close id=1 reason=timer_arm errno=EINVAL")
+
+    def test_timer_read_failure_closes_the_connection(self):
+        self.inject("-e", "trace=read", "--trace-fds=8,9,10,11,12", "--inject=read:error=EIO")
+        client, server = self.attached()
+        server.sendall(wheel_frame(120))
+        self.assert_refused(client, "[conn] close id=1 reason=timer_read errno=EIO")
+
+    def test_receive_error_is_not_reported_as_hangup(self):
+        self.inject("--inject=recvmsg:error=ECONNRESET:when=1")
+        client, server = self.dial(), self.accept()
+        client.sendall(msg(1, 1, 2))
+        self.assert_refused(client, "[conn] close id=1 reason=recv_client errno=ECONNRESET")
+
+    def test_send_error_names_errno(self):
+        self.inject("--inject=sendmsg:error=EPIPE:when=1")
+        client, server = self.dial(), self.accept()
+        client.sendall(msg(1, 1, 2))
+        self.assert_refused(client, "[conn] close id=1 reason=send_upstream errno=EPIPE")
+
+    def test_interrupted_wait_is_retried(self):
+        self.inject("--inject=epoll_wait:error=EINTR:when=1..3")
+        self.attached()
+        self.assertNotIn("refused", self.logtext())
+
+    def test_failed_wait_stops_instead_of_spinning(self):
+        self.inject("--inject=epoll_wait:error=EBADF:when=2")
+        try:
+            code = self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            code = None
+        self.assertEqual(1, code, "log=" + self.logtext())
+        self.assertIn("[loop] refused reason=epoll_wait errno=EBADF", self.logtext())
+
+    def test_failed_signal_read_stops(self):
+        self.inject("-e", "trace=read", "--trace-fds=4,5,6,7", "--inject=read:error=EIO")
+        self.wait_log("[wheelproxy] start pid=")
+        pid = int(self.logtext().split("start pid=")[1].split()[0])
+        os.kill(pid, signal.SIGTERM)
+        try:
+            code = self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            code = None
+        self.assertEqual(1, code, "log=" + self.logtext())
+        self.assertIn("[loop] refused reason=signal_read errno=EIO", self.logtext())
+
+
+class Startup(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        build()
+
+    def refused(self, *spec):
+        tmp = tempfile.mkdtemp(prefix="wp")
+        env = dict(os.environ, XDG_RUNTIME_DIR=tmp)
+        cmd = STRACE + list(spec) + [BIN, "--listen", "wayland-px", "--upstream", "wayland-up"]
+        proc = subprocess.Popen(cmd, env=env, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        try:
+            _, err = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            os.killpg(proc.pid, signal.SIGKILL)
+            _, err = proc.communicate(timeout=5)
+            self.fail("proxy kept running stderr=" + err)
+        self.assertEqual(1, proc.returncode, "stderr=" + err)
+        self.assertFalse(os.path.exists(os.path.join(tmp, "wayland-px")), "socket left behind")
+        return err
+
+    def test_signalfd_failure(self):
+        self.assertIn("[setup] refused reason=signalfd errno=ENOMEM",
+                      self.refused("--inject=signalfd4:error=ENOMEM"))
+
+    def test_epoll_create_failure(self):
+        self.assertIn("[setup] refused reason=epoll_create errno=EMFILE",
+                      self.refused("--inject=epoll_create1:error=EMFILE"))
+
+    def test_listener_watch_failure(self):
+        self.assertIn("[setup] refused reason=epoll_add errno=ENOSPC",
+                      self.refused("--inject=epoll_ctl:error=ENOSPC:when=1"))
+
+    def test_signal_mask_failure(self):
+        self.assertIn("[setup] refused reason=sigmask errno=EINVAL",
+                      self.refused("--inject=rt_sigprocmask:error=EINVAL:when=1"))
+
+    def test_spare_fd_failure(self):
+        self.assertIn("[setup] refused reason=spare_fd errno=EMFILE",
+                      self.refused("-e", "trace=openat", "-P", "/dev/null", "--inject=openat:error=EMFILE"))
+
+
 class Arguments(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        build()
+
     def test_bad_number_is_refused(self):
         res = subprocess.run([BIN, "--mult", "abc"], capture_output=True, text=True, timeout=10)
         self.assertEqual(2, res.returncode)
         self.assertIn("[args] refused", res.stderr)
         self.assertIn("--mult", res.stderr)
+
+    def run_in_dir(self, length):
+        tmp = tempfile.mkdtemp(prefix="wp")
+        deep = tmp + "/" + "d" * (length - len(tmp) - len("/wayland-px") - 1)
+        os.mkdir(deep)
+        env = dict(os.environ, XDG_RUNTIME_DIR=deep)
+        proc = subprocess.Popen([BIN, "--listen", "wayland-px", "--upstream", "wayland-up"], env=env,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            _, err = proc.communicate(timeout=0.5)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            _, err = proc.communicate(timeout=5)
+        self.assertEqual(length, len(os.path.join(deep, "wayland-px")))
+        return proc.returncode, err
+
+    def test_path_length_limit_is_exact(self):
+        code, err = self.run_in_dir(107)
+        self.assertIn("[wheelproxy] start", err)
+        code, err = self.run_in_dir(108)
+        self.assertEqual(2, code, err)
+        self.assertIn("reason=path_too_long", err)
+
+    def test_long_runtime_dir_is_refused(self):
+        tmp = tempfile.mkdtemp(prefix="wp" + "x" * 120)
+        env = dict(os.environ, XDG_RUNTIME_DIR=tmp)
+        try:
+            res = subprocess.run([BIN, "--listen", "wayland-px", "--upstream", "wayland-up"], env=env,
+                                 capture_output=True, text=True, timeout=3)
+        except subprocess.TimeoutExpired:
+            self.fail("proxy started on a truncated path")
+        self.assertEqual(2, res.returncode, res.stderr)
+        self.assertIn("[args] refused reason=path_too_long name=wayland-px max=107", res.stderr)
 
 
 if __name__ == "__main__":

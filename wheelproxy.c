@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { IN_CAP = 1 << 17, OUT_HIGH = 1 << 22, FD_CAP = 256, MAX_FDS = 28, MAX_POINTERS = 8 };
+enum { IN_CAP = 1 << 17, OUT_HIGH = 1 << 22, FD_CAP = 256, MAX_FDS = 28, MAX_POINTERS = 8, ID_MAX = (1 << 22) - 1 };
 enum { K_NONE, K_REGISTRY, K_SEAT, K_POINTER };
 enum { W_LISTEN, W_SIGNAL, W_CLIENT, W_SERVER, W_TIMER };
 enum { AXIS_VERTICAL = 0, SOURCE_WHEEL = 0 };
@@ -56,6 +56,7 @@ struct watch {
 struct conn {
     int id, cfd, sfd, tfd;
     bool dead, ticking;
+    double opened;
     struct watch wc, ws, wt;
     struct dir up, down;
     uint8_t *kind;
@@ -69,8 +70,11 @@ struct conn {
 
 static struct opts opt = {.mult = 1.65, .tau_ms = 70, .tick_ms = 1, .listen = "wayland-smooth"};
 static const double TAIL_PX = 4;
-static int epfd;
+static struct sockaddr_un listen_addr = {.sun_family = AF_UNIX}, upstream_addr = {.sun_family = AF_UNIX};
+static int epfd, spare = -1, served;
 static struct conn *conns;
+static char stop_reason[32];
+static int stop_status;
 
 static double mono_ms(void)
 {
@@ -86,7 +90,13 @@ static uint32_t rd32(const uint8_t *p)
     return v;
 }
 
-static void kill_conn(struct conn *c, const char *reason)
+static const char *errname(int err)
+{
+    const char *s = err ? strerrorname_np(err) : "none";
+    return s ? s : "unknown";
+}
+
+static void kill_conn(struct conn *c, const char *reason, int err)
 {
     if (c->dead)
         return;
@@ -94,8 +104,11 @@ static void kill_conn(struct conn *c, const char *reason)
     int notches = 0;
     for (int i = 0; i < c->nptr; i++)
         notches += c->ptr[i].notches;
-    fprintf(stderr, "[conn] close id=%d reason=%s bytes_up=%llu bytes_down=%llu notches=%d\n",
-            c->id, reason, (unsigned long long)c->up.bytes, (unsigned long long)c->down.bytes, notches);
+    fprintf(stderr,
+            "[conn] close id=%d reason=%s errno=%s ms=%.0f bytes_up=%llu bytes_down=%llu queued_up=%zu "
+            "queued_down=%zu fds_up=%d fds_down=%d notches=%d\n",
+            c->id, reason, errname(err), mono_ms() - c->opened, (unsigned long long)c->up.bytes,
+            (unsigned long long)c->down.bytes, c->up.out_len, c->down.out_len, c->up.nfds, c->down.nfds, notches);
 }
 
 static void put(struct conn *c, struct dir *d, const void *p, size_t n)
@@ -106,7 +119,7 @@ static void put(struct conn *c, struct dir *d, const void *p, size_t n)
             cap *= 2;
         uint8_t *grown = realloc(d->out, cap);
         if (!grown) {
-            kill_conn(c, "out_of_memory");
+            kill_conn(c, "out_of_memory", ENOMEM);
             return;
         }
         d->out = grown;
@@ -127,6 +140,11 @@ static void set_kind(struct conn *c, uint32_t id, uint8_t kind, uint32_t ver)
 {
     if (id >= 0xff000000u)
         return;
+    if (id > ID_MAX) {
+        fprintf(stderr, "[proto] error id=%d reason=id_range obj=%u max=%d\n", c->id, id, ID_MAX);
+        kill_conn(c, "id_range", 0);
+        return;
+    }
     if (id >= c->ids) {
         size_t n = c->ids ? c->ids : 1024;
         while (n <= id)
@@ -138,7 +156,7 @@ static void set_kind(struct conn *c, uint32_t id, uint8_t kind, uint32_t ver)
         if (v)
             c->ver = v;
         if (!k || !v) {
-            kill_conn(c, "out_of_memory");
+            kill_conn(c, "out_of_memory", ENOMEM);
             return;
         }
         memset(c->kind + c->ids, 0, n - c->ids);
@@ -164,8 +182,11 @@ static struct pointer *find_pointer(struct conn *c, uint32_t id)
 static void drop_pointer(struct conn *c, uint32_t id)
 {
     struct pointer *p = find_pointer(c, id);
-    if (p)
-        *p = c->ptr[--c->nptr];
+    if (!p)
+        return;
+    if (opt.verbose)
+        fprintf(stderr, "[pointer] drop id=%d pointer=%u\n", c->id, id);
+    *p = c->ptr[--c->nptr];
 }
 
 static void on_request(struct conn *c, const uint8_t *m, uint32_t size)
@@ -175,16 +196,27 @@ static void on_request(struct conn *c, const uint8_t *m, uint32_t size)
         set_kind(c, rd32(m + 8), K_REGISTRY, 0);
     } else if (kind_of(c, obj) == K_REGISTRY && op == 0 && size >= 16) {
         uint32_t len = rd32(m + 12), padded = (len + 3) & ~3u;
-        if (len == 0 || 16 + padded + 8 > size)
+        if (len == 0 || len > size || 16 + padded + 8 > size) {
+            fprintf(stderr, "[proto] warn id=%d reason=bad_bind len=%u size=%u\n", c->id, len, size);
             return;
+        }
         const char *iface = (const char *)m + 16;
         bool seat = len == sizeof "wl_seat" && memcmp(iface, "wl_seat", len) == 0;
-        set_kind(c, rd32(m + 20 + padded), seat ? K_SEAT : K_NONE, rd32(m + 16 + padded));
+        uint32_t id = rd32(m + 20 + padded), version = rd32(m + 16 + padded);
+        set_kind(c, id, seat ? K_SEAT : K_NONE, version);
+        if (seat && opt.verbose)
+            fprintf(stderr, "[seat] bind id=%d seat=%u version=%u\n", c->id, id, version);
     } else if (kind_of(c, obj) == K_SEAT && op == 0 && size >= 12) {
         uint32_t id = rd32(m + 8);
         set_kind(c, id, K_POINTER, c->ver[obj]);
-        if (c->nptr < MAX_POINTERS)
-            c->ptr[c->nptr++] = (struct pointer){.id = id, .version = c->ver[obj]};
+        if (c->nptr == MAX_POINTERS) {
+            fprintf(stderr, "[seat] untracked id=%d seat=%u pointer=%u reason=pointer_limit max=%d\n", c->id, obj, id,
+                    MAX_POINTERS);
+            return;
+        }
+        c->ptr[c->nptr++] = (struct pointer){.id = id, .version = c->ver[obj]};
+        if (opt.verbose)
+            fprintf(stderr, "[pointer] track id=%d pointer=%u version=%u\n", c->id, id, c->ver[obj]);
     }
 }
 
@@ -193,7 +225,10 @@ static void arm(struct conn *c, bool on)
     long ns = on ? (long)(opt.tick_ms * 1e6) : 0;
     struct itimerspec its = {.it_interval = {ns / 1000000000L, ns % 1000000000L}};
     its.it_value = its.it_interval;
-    timerfd_settime(c->tfd, 0, &its, NULL);
+    if (timerfd_settime(c->tfd, 0, &its, NULL) < 0) {
+        kill_conn(c, "timer_arm", errno);
+        return;
+    }
     c->ticking = on;
 }
 
@@ -297,8 +332,10 @@ static void flush(struct conn *c, struct dir *d)
 {
     while (d->out_len && !c->dead) {
         int nf = d->nfds < MAX_FDS ? d->nfds : MAX_FDS;
+        // keep a byte back for every later fd batch so no fds are stranded once the data drains
+        size_t later = (d->nfds - nf + MAX_FDS - 1) / MAX_FDS;
         char cbuf[CMSG_SPACE(sizeof(int) * MAX_FDS)] = {0};
-        struct iovec iov = {d->out, d->out_len};
+        struct iovec iov = {d->out, d->out_len > later ? d->out_len - later : d->out_len};
         struct msghdr mh = {.msg_iov = &iov, .msg_iovlen = 1};
         if (nf) {
             mh.msg_control = cbuf;
@@ -312,7 +349,7 @@ static void flush(struct conn *c, struct dir *d)
         ssize_t n = sendmsg(d->to, &mh, MSG_DONTWAIT | MSG_NOSIGNAL);
         if (n < 0) {
             if (errno != EAGAIN && errno != EINTR)
-                kill_conn(c, d == &c->up ? "send_upstream" : "send_client");
+                kill_conn(c, d == &c->up ? "send_upstream" : "send_client", errno);
             return;
         }
         for (int i = 0; i < nf; i++)
@@ -331,8 +368,8 @@ static void interest(struct conn *c)
                              .data.ptr = &c->wc};
     struct epoll_event es = {.events = (c->down.out_len < OUT_HIGH ? EPOLLIN : 0) | (c->up.out_len ? EPOLLOUT : 0),
                              .data.ptr = &c->ws};
-    epoll_ctl(epfd, EPOLL_CTL_MOD, c->cfd, &ec);
-    epoll_ctl(epfd, EPOLL_CTL_MOD, c->sfd, &es);
+    if (epoll_ctl(epfd, EPOLL_CTL_MOD, c->cfd, &ec) < 0 || epoll_ctl(epfd, EPOLL_CTL_MOD, c->sfd, &es) < 0)
+        kill_conn(c, "epoll_mod", errno);
 }
 
 static void pump(struct conn *c, struct dir *d)
@@ -343,8 +380,12 @@ static void pump(struct conn *c, struct dir *d)
     ssize_t n = recvmsg(d->from, &mh, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
     if (n < 0 && (errno == EAGAIN || errno == EINTR))
         return;
-    if (n <= 0) {
-        kill_conn(c, d == &c->up ? "client_hangup" : "upstream_hangup");
+    if (n < 0) {
+        kill_conn(c, d == &c->up ? "recv_client" : "recv_upstream", errno);
+        return;
+    }
+    if (n == 0) {
+        kill_conn(c, d == &c->up ? "client_hangup" : "upstream_hangup", 0);
         return;
     }
     for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
@@ -356,11 +397,15 @@ static void pump(struct conn *c, struct dir *d)
             memcpy(&fd, CMSG_DATA(cm) + i * sizeof(int), sizeof fd);
             if (d->nfds == FD_CAP) {
                 close(fd);
-                kill_conn(c, "fd_queue_full");
+                kill_conn(c, "fd_queue_full", 0);
                 continue;
             }
             d->fds[d->nfds++] = fd;
         }
+    }
+    if (mh.msg_flags & MSG_CTRUNC) {
+        kill_conn(c, "fd_truncated", 0);
+        return;
     }
     d->in_len += n;
     size_t off = 0;
@@ -368,7 +413,7 @@ static void pump(struct conn *c, struct dir *d)
         uint32_t size = rd32(d->in + off + 4) >> 16;
         if (size < 8 || size % 4) {
             fprintf(stderr, "[proto] error id=%d reason=bad_size size=%u obj=%u\n", c->id, size, rd32(d->in + off));
-            kill_conn(c, "bad_message");
+            kill_conn(c, "bad_message", 0);
             return;
         }
         if (d->in_len - off < size)
@@ -385,58 +430,21 @@ static void pump(struct conn *c, struct dir *d)
     d->in_len -= off;
 }
 
-static const char *runtime_path(const char *name, char *buf, size_t n)
+static bool runtime_path(const char *name, struct sockaddr_un *sa)
 {
     const char *dir = getenv("XDG_RUNTIME_DIR");
-    if (name[0] == '/')
-        snprintf(buf, n, "%s", name);
-    else
-        snprintf(buf, n, "%s/%s", dir ? dir : "", name);
-    return buf;
+    size_t n = sizeof sa->sun_path;
+    int len = name[0] == '/' ? snprintf(sa->sun_path, n, "%s", name) : snprintf(sa->sun_path, n, "%s/%s", dir, name);
+    if (len < (int)n)
+        return true;
+    fprintf(stderr, "[args] refused reason=path_too_long name=%s max=%zu\n", name, n - 1);
+    return false;
 }
 
-static void add_watch(int fd, struct watch *w, uint32_t events)
+static bool add_watch(int fd, struct watch *w, uint32_t events)
 {
     struct epoll_event ev = {.events = events, .data.ptr = w};
-    epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
-}
-
-static void accept_client(int lfd)
-{
-    static int next_id;
-    int cfd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
-    if (cfd < 0)
-        return;
-    char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
-    struct sockaddr_un sa = {.sun_family = AF_UNIX};
-    snprintf(sa.sun_path, sizeof sa.sun_path, "%s", runtime_path(opt.upstream, path, sizeof path));
-    int sfd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
-    if (sfd < 0 || connect(sfd, (struct sockaddr *)&sa, sizeof sa) < 0) {
-        fprintf(stderr, "[conn] refused reason=upstream_connect path=%s errno=%s\n", sa.sun_path, strerror(errno));
-        close(cfd);
-        if (sfd >= 0)
-            close(sfd);
-        return;
-    }
-    fcntl(sfd, F_SETFL, O_NONBLOCK);
-    struct conn *c = calloc(1, sizeof *c);
-    if (!c) {
-        close(cfd);
-        close(sfd);
-        return;
-    }
-    *c = (struct conn){.id = ++next_id, .cfd = cfd, .sfd = sfd, .next = conns};
-    c->tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
-    c->up.from = c->down.to = cfd;
-    c->up.to = c->down.from = sfd;
-    c->wc = (struct watch){W_CLIENT, c};
-    c->ws = (struct watch){W_SERVER, c};
-    c->wt = (struct watch){W_TIMER, c};
-    conns = c;
-    add_watch(cfd, &c->wc, EPOLLIN);
-    add_watch(sfd, &c->ws, EPOLLIN);
-    add_watch(c->tfd, &c->wt, EPOLLIN);
-    fprintf(stderr, "[conn] open id=%d upstream=%s\n", c->id, sa.sun_path);
+    return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev) == 0;
 }
 
 static void free_dir(struct dir *d)
@@ -444,6 +452,84 @@ static void free_dir(struct dir *d)
     for (int i = 0; i < d->nfds; i++)
         close(d->fds[i]);
     free(d->out);
+}
+
+static void free_conn(struct conn *c)
+{
+    int fds[] = {c->cfd, c->sfd, c->tfd};
+    for (int i = 0; i < 3; i++)
+        if (fds[i] >= 0)
+            close(fds[i]);
+    free_dir(&c->up);
+    free_dir(&c->down);
+    free(c->kind);
+    free(c->ver);
+    free(c);
+}
+
+// the spare fd lets a client be accepted and dropped when the fd table is full
+static void refuse_accept(int lfd, int err)
+{
+    if (err == EMFILE || err == ENFILE) {
+        close(spare);
+        int fd = accept4(lfd, NULL, NULL, SOCK_CLOEXEC);
+        if (fd >= 0)
+            close(fd);
+        spare = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    }
+    fprintf(stderr, "[conn] refused reason=accept errno=%s spare=%s\n", errname(err), spare >= 0 ? "ok" : "lost");
+}
+
+static const char *open_conn(struct conn *c)
+{
+    c->tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (c->tfd < 0)
+        return "timerfd";
+    c->sfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    if (c->sfd < 0)
+        return "upstream_connect";
+    if (!add_watch(c->cfd, &c->wc, EPOLLIN) || !add_watch(c->tfd, &c->wt, EPOLLIN) ||
+        !add_watch(c->sfd, &c->ws, EPOLLIN))
+        return "epoll_add";
+    if (connect(c->sfd, (struct sockaddr *)&upstream_addr, sizeof upstream_addr) < 0)
+        return "upstream_connect";
+    return NULL;
+}
+
+static void accept_client(int lfd)
+{
+    static int next_id;
+    int cfd = accept4(lfd, NULL, NULL, SOCK_NONBLOCK | SOCK_CLOEXEC);
+    if (cfd < 0) {
+        if (errno != EAGAIN && errno != EINTR)
+            refuse_accept(lfd, errno);
+        return;
+    }
+    struct conn *c = calloc(1, sizeof *c);
+    if (!c) {
+        fprintf(stderr, "[conn] refused reason=out_of_memory size=%zu\n", sizeof *c);
+        close(cfd);
+        return;
+    }
+    c->id = ++next_id;
+    c->cfd = c->up.from = c->down.to = cfd;
+    c->sfd = c->tfd = -1;
+    c->opened = mono_ms();
+    c->wc = (struct watch){W_CLIENT, c};
+    c->ws = (struct watch){W_SERVER, c};
+    c->wt = (struct watch){W_TIMER, c};
+    const char *why = open_conn(c);
+    if (why) {
+        fprintf(stderr, "[conn] refused id=%d reason=%s errno=%s upstream=%s\n", c->id, why, errname(errno),
+                upstream_addr.sun_path);
+        free_conn(c);
+        return;
+    }
+    c->up.to = c->down.from = c->sfd;
+    c->next = conns;
+    conns = c;
+    served++;
+    fprintf(stderr, "[conn] open id=%d upstream=%s\n", c->id, upstream_addr.sun_path);
 }
 
 static void reap(void)
@@ -455,22 +541,20 @@ static void reap(void)
             continue;
         }
         *pp = c->next;
-        close(c->cfd);
-        close(c->sfd);
-        close(c->tfd);
-        free_dir(&c->up);
-        free_dir(&c->down);
-        free(c->kind);
-        free(c->ver);
-        free(c);
+        free_conn(c);
     }
 }
 
 static void on_timer(struct conn *c)
 {
     uint64_t expirations;
-    if (read(c->tfd, &expirations, sizeof expirations) != sizeof expirations)
+    ssize_t n = read(c->tfd, &expirations, sizeof expirations);
+    if (n < 0 && errno == EAGAIN)
         return;
+    if (n != sizeof expirations) {
+        kill_conn(c, "timer_read", n < 0 ? errno : 0);
+        return;
+    }
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     double dt = (ts.tv_sec - c->last_tick.tv_sec) * 1e3 + (ts.tv_nsec - c->last_tick.tv_nsec) / 1e6;
@@ -527,54 +611,114 @@ static bool parse_args(int argc, char **argv)
         fprintf(stderr, "[args] refused reason=no_runtime_dir\n");
         return false;
     }
-    return true;
+    return runtime_path(opt.listen, &listen_addr) && runtime_path(opt.upstream, &upstream_addr);
 }
 
-static int open_listener(char *path, size_t n)
+static int open_listener(void)
 {
-    char lock[sizeof(((struct sockaddr_un *)0)->sun_path) + 8];
-    runtime_path(opt.listen, path, n);
+    const char *path = listen_addr.sun_path;
+    char lock[sizeof listen_addr.sun_path + 8];
     snprintf(lock, sizeof lock, "%s.lock", path);
     int lfd_lock = open(lock, O_CREAT | O_RDWR | O_CLOEXEC, 0640);
     if (lfd_lock < 0 || flock(lfd_lock, LOCK_EX | LOCK_NB) < 0) {
-        fprintf(stderr, "[listen] refused reason=lock path=%s errno=%s\n", lock, strerror(errno));
+        fprintf(stderr, "[listen] refused reason=lock path=%s errno=%s\n", lock, errname(errno));
         return -1;
     }
     unlink(path);
-    struct sockaddr_un sa = {.sun_family = AF_UNIX};
-    snprintf(sa.sun_path, sizeof sa.sun_path, "%s", path);
     int lfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
-    if (lfd < 0 || bind(lfd, (struct sockaddr *)&sa, sizeof sa) < 0 || listen(lfd, 16) < 0) {
-        fprintf(stderr, "[listen] refused reason=bind path=%s errno=%s\n", path, strerror(errno));
+    if (lfd < 0 || bind(lfd, (struct sockaddr *)&listen_addr, sizeof listen_addr) < 0 || listen(lfd, 16) < 0) {
+        fprintf(stderr, "[listen] refused reason=bind path=%s errno=%s\n", path, errname(errno));
         return -1;
     }
     return lfd;
+}
+
+static int refuse_setup(const char *reason)
+{
+    fprintf(stderr, "[setup] refused reason=%s errno=%s\n", reason, errname(errno));
+    unlink(listen_addr.sun_path);
+    return 1;
+}
+
+static void stop(const char *reason, int status)
+{
+    snprintf(stop_reason, sizeof stop_reason, "%s", reason);
+    stop_status = status;
+}
+
+static void dump_state(void)
+{
+    int n = 0;
+    for (struct conn *c = conns; c; c = c->next)
+        n++;
+    fprintf(stderr, "[state] conns=%d served=%d\n", n, served);
+    for (struct conn *c = conns; c; c = c->next) {
+        fprintf(stderr,
+                "[state] conn id=%d ms=%.0f bytes_up=%llu bytes_down=%llu queued_up=%zu queued_down=%zu fds_up=%d "
+                "fds_down=%d pointers=%d ticking=%d\n",
+                c->id, mono_ms() - c->opened, (unsigned long long)c->up.bytes, (unsigned long long)c->down.bytes,
+                c->up.out_len, c->down.out_len, c->up.nfds, c->down.nfds, c->nptr, c->ticking);
+        for (int i = 0; i < c->nptr; i++) {
+            struct pointer *p = &c->ptr[i];
+            fprintf(stderr, "[state] pointer id=%d pointer=%u version=%u remaining=%.1f notches=%d\n", c->id, p->id,
+                    p->version, p->remaining, p->notches);
+        }
+    }
+}
+
+static void on_signal(int sfd)
+{
+    struct signalfd_siginfo si;
+    if (read(sfd, &si, sizeof si) != sizeof si) {
+        fprintf(stderr, "[loop] refused reason=signal_read errno=%s\n", errname(errno));
+        stop("signal_read", 1);
+        return;
+    }
+    if (si.ssi_signo == SIGUSR1) {
+        dump_state();
+        return;
+    }
+    char name[16];
+    snprintf(name, sizeof name, "SIG%s", sigabbrev_np(si.ssi_signo));
+    stop(name, 0);
 }
 
 int main(int argc, char **argv)
 {
     if (!parse_args(argc, argv))
         return 2;
-    char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
-    int lfd = open_listener(path, sizeof path);
+    int lfd = open_listener();
     if (lfd < 0)
         return 1;
     sigset_t mask;
     sigemptyset(&mask);
     sigaddset(&mask, SIGTERM);
     sigaddset(&mask, SIGINT);
-    sigprocmask(SIG_BLOCK, &mask, NULL);
+    sigaddset(&mask, SIGUSR1);
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0)
+        return refuse_setup("sigmask");
     signal(SIGPIPE, SIG_IGN);
+    spare = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (spare < 0)
+        return refuse_setup("spare_fd");
     int sfd = signalfd(-1, &mask, SFD_CLOEXEC);
+    if (sfd < 0)
+        return refuse_setup("signalfd");
     epfd = epoll_create1(EPOLL_CLOEXEC);
+    if (epfd < 0)
+        return refuse_setup("epoll_create");
     struct watch wl = {W_LISTEN, NULL}, wsig = {W_SIGNAL, NULL};
-    add_watch(lfd, &wl, EPOLLIN);
-    add_watch(sfd, &wsig, EPOLLIN);
-    fprintf(stderr, "[wheelproxy] start listen=%s upstream=%s mult=%g tau_ms=%g tick_ms=%g\n",
-            path, opt.upstream, opt.mult, opt.tau_ms, opt.tick_ms);
-    for (bool running = true; running;) {
+    if (!add_watch(lfd, &wl, EPOLLIN) || !add_watch(sfd, &wsig, EPOLLIN))
+        return refuse_setup("epoll_add");
+    fprintf(stderr, "[wheelproxy] start pid=%d listen=%s upstream=%s mult=%g tau_ms=%g tick_ms=%g\n", getpid(),
+            listen_addr.sun_path, opt.upstream, opt.mult, opt.tau_ms, opt.tick_ms);
+    while (!*stop_reason) {
         struct epoll_event evs[32];
         int n = epoll_wait(epfd, evs, 32, 1000);
+        if (n < 0 && errno != EINTR) {
+            fprintf(stderr, "[loop] refused reason=epoll_wait errno=%s\n", errname(errno));
+            stop("epoll_wait", 1);
+        }
         for (int i = 0; i < n; i++) {
             struct watch *w = evs[i].data.ptr;
             struct conn *c = w->c;
@@ -583,7 +727,7 @@ int main(int argc, char **argv)
                 continue;
             }
             if (w->type == W_SIGNAL) {
-                running = false;
+                on_signal(sfd);
                 continue;
             }
             if (c->dead)
@@ -600,9 +744,9 @@ int main(int argc, char **argv)
         reap();
     }
     for (struct conn *c = conns; c; c = c->next)
-        kill_conn(c, "shutdown");
+        kill_conn(c, "shutdown", 0);
     reap();
-    unlink(path);
-    fprintf(stderr, "[wheelproxy] stop\n");
-    return 0;
+    unlink(listen_addr.sun_path);
+    fprintf(stderr, "[wheelproxy] stop reason=%s served=%d\n", stop_reason, served);
+    return stop_status;
 }
