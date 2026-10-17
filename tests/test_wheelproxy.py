@@ -452,6 +452,29 @@ class Smoothing(Proxy):
         self.assertNotIn(9, [op for op, _ in ops[leave:]], "ops=%r" % ops)
         self.assertLess(sum(v120_values(events)), 240)
 
+    def test_release_stops_scrolling_and_untracks_the_pointer(self):
+        self.server.sendall(wheel_frame(120))
+        early = timed_events(read_for(self.client, 0.012))
+        self.client.sendall(msg(POINTER, 1))
+        self.assertEqual(msg(POINTER, 1), read_exact(self.server, 8), "log=" + self.logtext())
+        marker = msg(9, 3, 7)
+        events = self.events_after(marker)
+        objs = [(o, op) for _, o, op, _ in events]
+        after = objs[objs.index((9, 3)) + 1:]
+        self.assertNotIn((POINTER, 9), after, "early=%d after=%r" % (len(early), after))
+        self.assertLess(sum(v120_values(early + events)), 240)
+        frame = wheel_frame(120)
+        self.server.sendall(frame)
+        self.assertEqual(frame, read_exact(self.client, len(frame)), "log=" + self.logtext())
+
+    def test_set_cursor_keeps_the_pointer_tracked(self):
+        cursor = msg(POINTER, 0, 5, 0, 0, 0)
+        self.client.sendall(cursor)
+        self.assertEqual(cursor, read_exact(self.server, len(cursor)))
+        values = v120_values(self.events_after(wheel_frame(120)))
+        self.assertEqual(240, sum(values), "values=%r log=%s" % (values, self.logtext()))
+        self.assertGreater(len(values), 1, "values=%r" % values)
+
 
 class Verbose(Proxy):
     args = Proxy.args + ["--verbose"]
@@ -471,7 +494,12 @@ class Verbose(Proxy):
         self.assertIn("[pointer] track id=1 pointer=4 version=9", self.logtext())
         self.server.sendall(msg(1, 1, POINTER))
         self.assertEqual(msg(1, 1, POINTER), read_exact(self.client, 12))
-        self.wait_log("[pointer] drop id=1 pointer=4")
+        self.wait_log("[pointer] drop id=1 pointer=4 reason=delete_id")
+
+    def test_release_is_logged(self):
+        self.client.sendall(msg(POINTER, 1))
+        self.assertEqual(msg(POINTER, 1), read_exact(self.server, 8))
+        self.wait_log("[pointer] drop id=1 pointer=4 reason=release")
 
     def test_timer_stops_after_settling(self):
         self.events_after(wheel_frame(90))

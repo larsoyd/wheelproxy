@@ -21,7 +21,7 @@ enum { IN_CAP = 1 << 17, OUT_HIGH = 1 << 22, FD_CAP = 256, MAX_FDS = 28, MAX_POI
 enum { K_NONE, K_REGISTRY, K_SEAT, K_POINTER };
 enum { W_LISTEN, W_SIGNAL, W_CLIENT, W_SERVER, W_TIMER };
 enum { AXIS_VERTICAL = 0, SOURCE_WHEEL = 0 };
-enum { PTR_LEAVE = 1, PTR_AXIS = 4, PTR_FRAME = 5, PTR_SOURCE = 6, PTR_V120 = 9 };
+enum { PTR_RELEASE = 1, PTR_LEAVE = 1, PTR_AXIS = 4, PTR_FRAME = 5, PTR_SOURCE = 6, PTR_V120 = 9 };
 
 struct opts {
     const char *listen, *upstream;
@@ -180,13 +180,13 @@ static struct pointer *find_pointer(struct conn *c, uint32_t id)
     return NULL;
 }
 
-static void drop_pointer(struct conn *c, uint32_t id)
+static void drop_pointer(struct conn *c, uint32_t id, const char *reason)
 {
     struct pointer *p = find_pointer(c, id);
     if (!p)
         return;
     if (opt.verbose)
-        fprintf(stderr, "[pointer] drop id=%d pointer=%u\n", c->id, id);
+        fprintf(stderr, "[pointer] drop id=%d pointer=%u reason=%s\n", c->id, id, reason);
     *p = c->ptr[--c->nptr];
 }
 
@@ -218,6 +218,8 @@ static void on_request(struct conn *c, const uint8_t *m, uint32_t size)
         c->ptr[c->nptr++] = (struct pointer){.id = id, .version = c->ver[obj]};
         if (opt.verbose)
             fprintf(stderr, "[pointer] track id=%d pointer=%u version=%u\n", c->id, id, c->ver[obj]);
+    } else if (kind_of(c, obj) == K_POINTER && op == PTR_RELEASE) {
+        drop_pointer(c, obj, "release");
     }
 }
 
@@ -325,7 +327,7 @@ static void on_event(struct conn *c, const uint8_t *m, uint32_t size)
     if (obj == 1 && op == 1 && size >= 12) {
         uint32_t id = rd32(m + 8);
         if (kind_of(c, id) == K_POINTER)
-            drop_pointer(c, id);
+            drop_pointer(c, id, "delete_id");
         set_kind(c, id, K_NONE, 0);
     } else if (kind_of(c, obj) == K_POINTER) {
         struct pointer *p = find_pointer(c, obj);
