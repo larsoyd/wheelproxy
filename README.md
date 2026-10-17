@@ -139,11 +139,15 @@ Restarting the proxy closes every browser window connected through it, so quit t
 
 ## Troubleshooting
 
-- `journalctl --user -u wheelproxy` shows connections opening and closing, with byte counts and the reason
-  for each close.
-- With `--verbose` it also logs each notch, e.g. `[wheel] pointer=44 v120=120 remaining=198.0`, and the end
-  of each scroll, e.g. `[wheel] settled pointer=44 steps=52 ms=208.0`. No `[wheel]` lines while you scroll
-  means the browser is not connected through the proxy.
+- `journalctl --user -u wheelproxy` shows connections opening and closing, with byte counts, queue sizes,
+  age and the reason and errno for each close. A browser the proxy could not serve shows up as a
+  `[conn] refused` line, e.g. `reason=upstream_connect errno=EAGAIN` when the compositor is not accepting.
+- `systemctl --user kill -s USR1 wheelproxy.service` prints every open connection and tracked pointer as
+  `[state]` lines without interrupting anything.
+- With `--verbose` it also logs each seat and pointer it tracks, each notch, e.g.
+  `[wheel] pointer=44 v120=120 remaining=198.0`, and the end of each scroll, e.g.
+  `[wheel] settled pointer=44 steps=52 ms=208.0`. No `[wheel]` lines while you scroll means the browser is
+  not connected through the proxy.
 - To check a running browser, read its environment: `tr '\0' '\n' < /proc/<pid>/environ | grep WAYLAND`
   should show `WAYLAND_DISPLAY=wayland-smooth`.
 
