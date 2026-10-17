@@ -17,7 +17,7 @@
 #include <time.h>
 #include <unistd.h>
 
-enum { IN_CAP = 1 << 17, OUT_HIGH = 1 << 22, FD_CAP = 256, MAX_FDS = 28, MAX_POINTERS = 8, ID_MAX = (1 << 22) - 1 };
+enum { IN_CAP = 1 << 17, OUT_HIGH = 1 << 22, FD_CAP = 256, MAX_FDS = 28, MAX_POINTERS = 8, ID_MAX = (1 << 22) - 1, CONNECT_RETRIES = 11 };
 enum { K_NONE, K_REGISTRY, K_SEAT, K_POINTER };
 enum { W_LISTEN, W_SIGNAL, W_CLIENT, W_SERVER, W_TIMER };
 enum { AXIS_VERTICAL = 0, SOURCE_WHEEL = 0 };
@@ -54,8 +54,8 @@ struct watch {
 };
 
 struct conn {
-    int id, cfd, sfd, tfd;
-    bool dead, ticking;
+    int id, cfd, sfd, tfd, retries;
+    bool dead, ticking, connecting;
     double opened;
     struct watch wc, ws, wt;
     struct dir up, down;
@@ -106,9 +106,10 @@ static void kill_conn(struct conn *c, const char *reason, int err)
         notches += c->ptr[i].notches;
     fprintf(stderr,
             "[conn] close id=%d reason=%s errno=%s ms=%.0f bytes_up=%llu bytes_down=%llu queued_up=%zu "
-            "queued_down=%zu fds_up=%d fds_down=%d notches=%d\n",
+            "queued_down=%zu fds_up=%d fds_down=%d notches=%d retries=%d\n",
             c->id, reason, errname(err), mono_ms() - c->opened, (unsigned long long)c->up.bytes,
-            (unsigned long long)c->down.bytes, c->up.out_len, c->down.out_len, c->up.nfds, c->down.nfds, notches);
+            (unsigned long long)c->down.bytes, c->up.out_len, c->down.out_len, c->up.nfds, c->down.nfds, notches,
+            c->retries);
 }
 
 static void put(struct conn *c, struct dir *d, const void *p, size_t n)
@@ -220,12 +221,18 @@ static void on_request(struct conn *c, const uint8_t *m, uint32_t size)
     }
 }
 
+static bool set_timer(struct conn *c, double ms, bool repeat)
+{
+    long ns = (long)(ms * 1e6);
+    struct itimerspec its = {.it_value = {ns / 1000000000L, ns % 1000000000L}};
+    if (repeat)
+        its.it_interval = its.it_value;
+    return timerfd_settime(c->tfd, 0, &its, NULL) == 0;
+}
+
 static void arm(struct conn *c, bool on)
 {
-    long ns = on ? (long)(opt.tick_ms * 1e6) : 0;
-    struct itimerspec its = {.it_interval = {ns / 1000000000L, ns % 1000000000L}};
-    its.it_value = its.it_interval;
-    if (timerfd_settime(c->tfd, 0, &its, NULL) < 0) {
+    if (!set_timer(c, on ? opt.tick_ms : 0, true)) {
         kill_conn(c, "timer_arm", errno);
         return;
     }
@@ -480,20 +487,67 @@ static void refuse_accept(int lfd, int err)
     fprintf(stderr, "[conn] refused reason=accept errno=%s spare=%s\n", errname(err), spare >= 0 ? "ok" : "lost");
 }
 
+static void refuse_conn(struct conn *c, const char *why, int err)
+{
+    fprintf(stderr, "[conn] refused id=%d reason=%s errno=%s retries=%d ms=%.0f upstream=%s\n", c->id, why,
+            errname(err), c->retries, mono_ms() - c->opened, upstream_addr.sun_path);
+    c->dead = true;
+}
+
+static void opened(struct conn *c)
+{
+    served++;
+    fprintf(stderr, "[conn] open id=%d retries=%d upstream=%s\n", c->id, c->retries, upstream_addr.sun_path);
+}
+
+// a full compositor backlog is retried on the conn timer so the loop never blocks on it
+static const char *dial(struct conn *c)
+{
+    if (connect(c->sfd, (struct sockaddr *)&upstream_addr, sizeof upstream_addr) == 0) {
+        c->connecting = false;
+        return NULL;
+    }
+    if (errno != EAGAIN || c->retries == CONNECT_RETRIES)
+        return "upstream_connect";
+    int delay_ms = 1 << c->retries++;
+    fprintf(stderr, "[conn] retry id=%d reason=upstream_connect errno=EAGAIN attempt=%d delay_ms=%d\n", c->id,
+            c->retries, delay_ms);
+    if (!set_timer(c, delay_ms, false))
+        return "timer_arm";
+    c->connecting = true;
+    return NULL;
+}
+
 static const char *open_conn(struct conn *c)
 {
     c->tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
     if (c->tfd < 0)
         return "timerfd";
-    c->sfd = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+    c->sfd = c->up.to = c->down.from = socket(AF_UNIX, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
     if (c->sfd < 0)
         return "upstream_connect";
     if (!add_watch(c->cfd, &c->wc, EPOLLIN) || !add_watch(c->tfd, &c->wt, EPOLLIN) ||
         !add_watch(c->sfd, &c->ws, EPOLLIN))
         return "epoll_add";
-    if (connect(c->sfd, (struct sockaddr *)&upstream_addr, sizeof upstream_addr) < 0)
-        return "upstream_connect";
+    const char *why = dial(c);
+    if (why || !c->connecting)
+        return why;
+    // an unconnected stream socket polls as hung up so it stays out of epoll until connected
+    struct epoll_event hangup = {.data.ptr = &c->wc};
+    if (epoll_ctl(epfd, EPOLL_CTL_DEL, c->sfd, NULL) < 0 || epoll_ctl(epfd, EPOLL_CTL_MOD, c->cfd, &hangup) < 0)
+        return "epoll_mod";
     return NULL;
+}
+
+static void redial(struct conn *c)
+{
+    const char *why = dial(c);
+    if (!why && !c->connecting && !add_watch(c->sfd, &c->ws, EPOLLIN))
+        why = "epoll_add";
+    if (why)
+        refuse_conn(c, why, errno);
+    else if (!c->connecting)
+        opened(c);
 }
 
 static void accept_client(int lfd)
@@ -518,18 +572,13 @@ static void accept_client(int lfd)
     c->wc = (struct watch){W_CLIENT, c};
     c->ws = (struct watch){W_SERVER, c};
     c->wt = (struct watch){W_TIMER, c};
-    const char *why = open_conn(c);
-    if (why) {
-        fprintf(stderr, "[conn] refused id=%d reason=%s errno=%s upstream=%s\n", c->id, why, errname(errno),
-                upstream_addr.sun_path);
-        free_conn(c);
-        return;
-    }
-    c->up.to = c->down.from = c->sfd;
     c->next = conns;
     conns = c;
-    served++;
-    fprintf(stderr, "[conn] open id=%d upstream=%s\n", c->id, upstream_addr.sun_path);
+    const char *why = open_conn(c);
+    if (why)
+        refuse_conn(c, why, errno);
+    else if (!c->connecting)
+        opened(c);
 }
 
 static void reap(void)
@@ -559,7 +608,10 @@ static void on_timer(struct conn *c)
     clock_gettime(CLOCK_MONOTONIC, &ts);
     double dt = (ts.tv_sec - c->last_tick.tv_sec) * 1e3 + (ts.tv_nsec - c->last_tick.tv_nsec) / 1e6;
     c->last_tick = ts;
-    tick(c, dt);
+    if (c->connecting)
+        redial(c);
+    else
+        tick(c, dt);
 }
 
 static bool parse_num(const char *flag, const char *s, double lo, double *out)
@@ -655,9 +707,10 @@ static void dump_state(void)
     for (struct conn *c = conns; c; c = c->next) {
         fprintf(stderr,
                 "[state] conn id=%d ms=%.0f bytes_up=%llu bytes_down=%llu queued_up=%zu queued_down=%zu fds_up=%d "
-                "fds_down=%d pointers=%d ticking=%d\n",
+                "fds_down=%d pointers=%d ticking=%d connecting=%d retries=%d\n",
                 c->id, mono_ms() - c->opened, (unsigned long long)c->up.bytes, (unsigned long long)c->down.bytes,
-                c->up.out_len, c->down.out_len, c->up.nfds, c->down.nfds, c->nptr, c->ticking);
+                c->up.out_len, c->down.out_len, c->up.nfds, c->down.nfds, c->nptr, c->ticking, c->connecting,
+                c->retries);
         for (int i = 0; i < c->nptr; i++) {
             struct pointer *p = &c->ptr[i];
             fprintf(stderr, "[state] pointer id=%d pointer=%u version=%u remaining=%.1f notches=%d\n", c->id, p->id,
@@ -734,11 +787,13 @@ int main(int argc, char **argv)
                 continue;
             if (w->type == W_TIMER)
                 on_timer(c);
+            else if (c->connecting)
+                kill_conn(c, "client_hangup", 0);
             else if (evs[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR))
                 pump(c, w->type == W_CLIENT ? &c->up : &c->down);
             flush(c, &c->up);
             flush(c, &c->down);
-            if (!c->dead)
+            if (!c->dead && !c->connecting)
                 interest(c);
         }
         reap();

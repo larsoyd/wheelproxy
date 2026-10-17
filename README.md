@@ -141,7 +141,10 @@ Restarting the proxy closes every browser window connected through it, so quit t
 
 - `journalctl --user -u wheelproxy` shows connections opening and closing, with byte counts, queue sizes,
   age and the reason and errno for each close. A browser the proxy could not serve shows up as a
-  `[conn] refused` line, e.g. `reason=upstream_connect errno=EAGAIN` when the compositor is not accepting.
+  `[conn] refused` line with the reason and errno.
+- When the compositor is not accepting new connections, the proxy logs a `[conn] retry` line for each
+  attempt and keeps trying for about 2 seconds, then refuses with `reason=upstream_connect errno=EAGAIN
+  retries=11`. Browsers already connected are not held up while it waits.
 - `systemctl --user kill -s USR1 wheelproxy.service` prints every open connection and tracked pointer as
   `[state]` lines without interrupting anything.
 - With `--verbose` it also logs each seat and pointer it tracks, each notch, e.g.

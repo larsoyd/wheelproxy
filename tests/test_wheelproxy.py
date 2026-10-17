@@ -127,7 +127,7 @@ class Proxy(unittest.TestCase):
         self.upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         self.upstream.bind(os.path.join(self.tmp, "wayland-up"))
         self.upstream.listen(4)
-        self.log = open(os.path.join(self.tmp, "log"), "w+")
+        self.log = open(os.path.join(self.tmp, "log"), "a+")
         self.proc = None
         self.socks = []
         self.client = self.server = None
@@ -300,7 +300,7 @@ class Lifecycle(Proxy):
         self.client.close()
         self.wait_log("[conn] close id=1 reason=client_hangup errno=none ms=")
         log = self.logtext()
-        self.assertIn("queued_up=0 queued_down=0 fds_up=0 fds_down=0", log)
+        self.assertIn("queued_up=0 queued_down=0 fds_up=0 fds_down=0 notches=0 retries=0", log)
         self.assertLess(int(log.split(" ms=")[1].split()[0]), 5000, log)
 
     def test_sigterm_logs_why_it_stopped(self):
@@ -316,7 +316,8 @@ class Debug(Proxy):
         os.kill(self.proc.pid, signal.SIGUSR1)
         self.wait_log("[state] conns=1 served=1")
         log = self.logtext()
-        self.assertIn("queued_up=0 queued_down=0 fds_up=0 fds_down=0 pointers=1 ticking=0", log)
+        self.assertIn("queued_up=0 queued_down=0 fds_up=0 fds_down=0 pointers=1 ticking=0 connecting=0 retries=0",
+                      log)
         self.assertIn("[state] conn id=1 ms=", log)
         self.assertIn("[state] pointer id=1 pointer=4 version=9 remaining=0.0 notches=0", log)
         self.client.sendall(msg(5, 0, 1))
@@ -643,8 +644,9 @@ class MemoryLimit(Proxy):
 
 
 class FullBacklog(Proxy):
-    def test_full_compositor_backlog_does_not_stall_other_clients(self):
+    def fill(self):
         path = os.path.join(self.tmp, "wayland-up")
+        queued = 0
         for _ in range(64):
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             self.socks.append(s)
@@ -652,9 +654,19 @@ class FullBacklog(Proxy):
             try:
                 s.connect(path)
             except BlockingIOError:
-                break
-        else:
-            self.fail("compositor backlog never filled")
+                return queued
+            queued += 1
+        self.fail("compositor backlog never filled")
+
+    def drain(self, queued):
+        for _ in range(queued):
+            self.accept()
+
+    def retries(self):
+        return self.logtext().count("[conn] retry id=2 ")
+
+    def test_full_compositor_backlog_does_not_stall_other_clients(self):
+        self.fill()
         late = self.dial()
         time.sleep(0.1)
         self.client.sendall(msg(5, 0, 1))
@@ -663,8 +675,56 @@ class FullBacklog(Proxy):
         except socket.timeout:
             got = b""
         self.assertEqual(msg(5, 0, 1), got, "proxy stalled log=" + self.logtext())
-        self.assertTrue(self.closed(late))
-        self.assertIn("reason=upstream_connect errno=EAGAIN", self.logtext())
+        start = time.monotonic()
+        self.assertTrue(self.closed(late, seconds=5), "log=" + self.logtext())
+        self.assertGreater(time.monotonic() - start, 1.5, "gave up early log=" + self.logtext())
+        self.assertIn("[conn] refused id=2 reason=upstream_connect errno=EAGAIN retries=11 ms=", self.logtext())
+        self.assertIn("[conn] retry id=2 reason=upstream_connect errno=EAGAIN attempt=11 delay_ms=1024",
+                      self.logtext())
+
+    def test_waiting_client_connects_once_the_backlog_drains(self):
+        queued = self.fill()
+        late = self.dial()
+        setup = msg(1, 1, 2) + msg(2, 0, 7, "wl_seat", 9, 3) + msg(3, 0, POINTER)
+        late.sendall(setup)
+        self.wait_log("[conn] retry id=2 reason=upstream_connect errno=EAGAIN attempt=1 delay_ms=1")
+        before = cpu_seconds(self.proc.pid)
+        time.sleep(0.3)
+        burned = cpu_seconds(self.proc.pid) - before
+        self.assertLess(burned, 0.1, "cpu seconds in 0.3 s while waiting=%.2f" % burned)
+        os.kill(self.proc.pid, signal.SIGUSR1)
+        self.wait_log("[state] conns=2 served=1")
+        self.assertRegex(self.logtext(), r"\[state\] conn id=2 .* connecting=1 retries=\d+")
+        self.drain(queued)
+        server = self.accept()
+        self.assertEqual(setup, read_exact(server, len(setup)), "log=" + self.logtext())
+        self.wait_log("[conn] open id=2 retries=")
+        server.sendall(wheel_frame(120))
+        self.assertEqual(240, sum(v120_values(timed_events(read_for(late, 1.0, 0.15)))), "log=" + self.logtext())
+
+    def test_client_that_leaves_while_waiting_is_closed(self):
+        queued = self.fill()
+        late = self.dial()
+        self.wait_log("[conn] retry id=2 ")
+        late.sendall(msg(1, 1, 2))
+        late.close()
+        self.wait_log("[conn] close id=2 reason=client_hangup errno=none")
+        self.assertRegex(self.logtext(), r"\[conn\] close id=2 .* retries=[1-9]")
+        seen = self.retries()
+        self.drain(queued)
+        time.sleep(0.3)
+        self.assertEqual(seen, self.retries(), "kept retrying log=" + self.logtext())
+        self.upstream.settimeout(0.2)
+        self.assertRaises(socket.timeout, self.upstream.accept)
+
+    def test_compositor_gone_while_waiting_refuses_with_its_errno(self):
+        self.fill()
+        late = self.dial()
+        self.wait_log("[conn] retry id=2 ")
+        self.upstream.close()
+        self.assertTrue(self.closed(late), "log=" + self.logtext())
+        self.assertIn("[conn] refused id=2 reason=upstream_connect errno=ECONNREFUSED retries=", self.logtext())
+        self.assertLess(self.retries(), 11, "log=" + self.logtext())
 
 
 class Faults(Proxy):
@@ -722,6 +782,28 @@ class Faults(Proxy):
         client, server = self.attached()
         server.sendall(wheel_frame(120))
         self.assert_refused(client, "[conn] close id=1 reason=timer_arm errno=EINVAL")
+
+    def test_connect_backlog_is_retried_with_backoff(self):
+        self.inject("--inject=connect:error=EAGAIN:when=1..3")
+        client = self.dial()
+        setup = msg(1, 1, 2) + msg(2, 0, 7, "wl_seat", 9, 3) + msg(3, 0, POINTER)
+        client.sendall(setup)
+        self.assertEqual(setup, read_exact(self.accept(), len(setup)), "log=" + self.logtext())
+        self.wait_log("[conn] open id=1 retries=3 upstream=")
+        log = self.logtext()
+        for attempt, delay in ((1, 1), (2, 2), (3, 4)):
+            self.assertIn("[conn] retry id=1 reason=upstream_connect errno=EAGAIN attempt=%d delay_ms=%d"
+                          % (attempt, delay), log)
+
+    def test_retry_timer_failure_refuses_the_client(self):
+        self.inject("--inject=connect:error=EAGAIN:when=1", "--inject=timerfd_settime:error=EINVAL:when=1")
+        self.assert_refused(self.dial(), "[conn] refused id=1 reason=timer_arm errno=EINVAL retries=1")
+        self.attached()
+
+    def test_retry_epoll_failure_refuses_the_client(self):
+        self.inject("--inject=connect:error=EAGAIN:when=1", "--inject=epoll_ctl:error=ENOMEM:when=6")
+        self.assert_refused(self.dial(), "[conn] refused id=1 reason=epoll_mod errno=ENOMEM retries=1")
+        self.attached()
 
     def test_timer_read_failure_closes_the_connection(self):
         self.inject("-e", "trace=read", "--trace-fds=8,9,10,11,12", "--inject=read:error=EIO")
