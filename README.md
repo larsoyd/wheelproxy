@@ -56,11 +56,14 @@ send `wl_pointer.axis_value120` (Wayland 1.21 and later), but only KWin has been
 ## Install for Google Chrome
 
 ```sh
-make
-make test
-make install-desktop
-systemctl --user enable --now wheelproxy.service
+./install.sh
 ```
+
+It builds and runs the tests, installs the files and menu entries, enables the user service and starts
+it. To update, pull and run it again: it restarts the service on the new build and checks that the new
+process came up. A restart closes every browser window connected through the proxy, so while browsers are
+connected it installs the files but leaves the running proxy alone and exits with status 3. Quit them and
+run it again, or pass `--restart-now`. `ENTRIES` and `PREFIX` work as with make.
 
 Then quit the browser completely and start it again from the application menu.
 
