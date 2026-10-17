@@ -14,7 +14,11 @@ Everything else on the connection, file descriptors included, passes through byt
 
     make
     make test
-    make install            # installs to ~/.local/bin
+    make install            # binary and launcher to ~/.local/bin, user service to ~/.config/systemd/user
+    systemctl --user enable --now wheelproxy.service
+
+`google-chrome-smooth` starts Chrome through the proxy with smooth scrolling off. If the proxy is not
+answering, it starts Chrome directly instead. Point your desktop entry's Exec lines at it.
 
 ## Run
 

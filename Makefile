@@ -10,6 +10,8 @@ test: build/wheelproxy
 
 install: build/wheelproxy
 	install -Dm755 build/wheelproxy $(PREFIX)/bin/wheelproxy
+	install -Dm755 contrib/google-chrome-smooth.sh $(PREFIX)/bin/google-chrome-smooth
+	install -Dm644 contrib/wheelproxy.service $(HOME)/.config/systemd/user/wheelproxy.service
 
 clean:
 	rm -rf build
