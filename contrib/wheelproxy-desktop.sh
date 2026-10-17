@@ -19,7 +19,7 @@ refresh() {
         echo "[desktop] refused entry=$name reason=no_exec src=$src" >&2
         return 1
     fi
-    want=$(sed "s|^Exec=|Exec=$launch |" "$src"; echo x)
+    want=$(sed "/^Exec=[^ ]*wheelproxy-launch /!s|^Exec=|Exec=$launch |" "$src"; echo x)
     want=${want%x}
     if [ -f "$dst" ] && [ "$(cat "$dst"; echo x)" = "${want}x" ]; then
         echo "[desktop] up_to_date entry=$name" >&2

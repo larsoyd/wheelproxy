@@ -103,6 +103,12 @@ class Desktop(unittest.TestCase):
         self.assertIn("[desktop] refused entry=odd.desktop reason=no_exec", err)
         self.assertFalse(os.path.exists(os.path.join(self.dst, "odd.desktop")))
 
+    def test_entry_already_routed_system_wide_is_not_wrapped_twice(self):
+        system = CHROME.replace("Exec=", "Exec=/usr/bin/wheelproxy-launch ")
+        self.write("google-chrome.desktop", system)
+        self.run_tool("google-chrome.desktop")
+        self.assertEqual(system, self.read("google-chrome.desktop"))
+
     def test_no_entries_is_refused(self):
         err = self.run_tool(code=2)
         self.assertIn("[desktop] refused reason=no_entries", err)
