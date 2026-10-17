@@ -64,6 +64,9 @@ Before building, it lists the Chromium-based browsers installed on this system a
 through the proxy. Answer with their numbers separated by commas, for example `1,3`. The package installs the
 proxy and launcher in `/usr/bin`, a user service enabled for every user, and a pacman hook.
 
+To route every Chromium-based browser without being asked, including ones installed later, build
+`packaging/wheelproxy-all-git` instead. The two packages conflict, so only one can be installed.
+
 The choice is kept in `/etc/wheelproxy/browsers`, one pacman package name per line, or `all`. Edit it and run
 `sudo wheelproxy-browsers apply` to change it later.
 

@@ -6,6 +6,7 @@ import unittest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PKG = os.path.join(ROOT, "packaging", "wheelproxy-git")
+PKG_ALL = os.path.join(ROOT, "packaging", "wheelproxy-all-git")
 
 STUB = """#!/usr/bin/env bash
 echo "${0##*/} $*" >> "$STUB/calls"
@@ -103,6 +104,28 @@ class Packaging(unittest.TestCase):
                         code=2)
         self.assertNotIn("reached", res.stdout)
         self.assertIn("[browsers] refused reason=no_answer", res.stderr)
+
+    def test_all_package_routes_every_browser_without_asking(self):
+        subprocess.run(["make", "-C", ROOT, "build/wheelproxy"], check=True, capture_output=True, timeout=120)
+        pkgdir, res = self.build(pkg=PKG_ALL)
+        self.assertNotIn("1)", res.stderr)
+        with open(os.path.join(pkgdir, "etc/wheelproxy/browsers")) as f:
+            self.assertEqual("all\n", f.read())
+        self.assertEqual(0o644, os.stat(os.path.join(pkgdir, "etc/wheelproxy/browsers")).st_mode & 0o777)
+        for path in ("usr/bin/wheelproxy", "usr/bin/wheelproxy-launch", "usr/bin/wheelproxy-browsers",
+                     "usr/share/libalpm/hooks/wheelproxy-browsers.hook", "usr/lib/systemd/user/wheelproxy.service",
+                     "usr/share/licenses/wheelproxy-all-git/LICENSE"):
+            self.assertTrue(os.path.isfile(os.path.join(pkgdir, path)), path)
+
+    def test_all_package_srcinfo_conflicts_with_the_picking_one(self):
+        info = set(self.bash("makepkg --printsrcinfo", pkg=PKG_ALL).stdout.replace("\t", "").splitlines())
+        for line in ("pkgname = wheelproxy-all-git", "backup = etc/wheelproxy/browsers",
+                     "install = wheelproxy.install", "provides = wheelproxy", "conflicts = wheelproxy"):
+            self.assertIn(line, info)
+
+    def test_both_packages_share_one_install_script(self):
+        with open(os.path.join(PKG, "wheelproxy.install")) as a, open(os.path.join(PKG_ALL, "wheelproxy.install")) as b:
+            self.assertEqual(a.read(), b.read())
 
 
 if __name__ == "__main__":

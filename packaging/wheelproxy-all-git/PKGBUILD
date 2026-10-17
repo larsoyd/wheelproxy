@@ -1,0 +1,47 @@
+pkgname=wheelproxy-all-git
+pkgver=r14.360a134
+pkgrel=1
+pkgdesc='Smooth mouse-wheel scrolling on Wayland for every Chromium-based browser'
+arch=(x86_64 aarch64)
+url=https://github.com/larsoyd/wheelproxy
+license=(MIT)
+depends=(glibc bash python)
+makedepends=(git)
+checkdepends=(strace)
+provides=(wheelproxy)
+conflicts=(wheelproxy)
+backup=(etc/wheelproxy/browsers)
+install=wheelproxy.install
+source=(git+https://github.com/larsoyd/wheelproxy.git)
+sha256sums=(SKIP)
+
+pkgver() {
+    cd wheelproxy
+    printf 'r%s.%s' "$(git rev-list --count HEAD)" "$(git rev-parse --short=7 HEAD)"
+}
+
+prepare() {
+    echo all > browsers
+}
+
+build() {
+    cd wheelproxy
+    make
+}
+
+check() {
+    cd wheelproxy
+    make test
+}
+
+package() {
+    cd wheelproxy
+    install -Dm755 build/wheelproxy "$pkgdir/usr/bin/wheelproxy"
+    install -Dm755 contrib/wheelproxy-launch.sh "$pkgdir/usr/bin/wheelproxy-launch"
+    install -Dm755 contrib/wheelproxy-browsers.sh "$pkgdir/usr/bin/wheelproxy-browsers"
+    install -Dm644 contrib/wheelproxy-browsers.hook "$pkgdir/usr/share/libalpm/hooks/wheelproxy-browsers.hook"
+    sed 's|%h/.local/bin/|/usr/bin/|' contrib/wheelproxy.service > "$srcdir/wheelproxy.service"
+    install -Dm644 "$srcdir/wheelproxy.service" "$pkgdir/usr/lib/systemd/user/wheelproxy.service"
+    install -Dm644 "$srcdir/browsers" "$pkgdir/etc/wheelproxy/browsers"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}
