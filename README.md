@@ -18,7 +18,10 @@ Everything else on the connection, file descriptors included, passes through byt
     systemctl --user enable --now wheelproxy.service
 
 `google-chrome-smooth` starts Chrome through the proxy with smooth scrolling off. If the proxy is not
-answering, it starts Chrome directly instead. Point your desktop entry's Exec lines at it.
+answering, it starts Chrome directly instead. `make install` also writes a copy of Chrome's desktop entry to
+`~/.local/share/applications` with its Exec lines pointing at the launcher. An autostart entry runs
+`wheelproxy-refresh-desktop` at each login to regenerate that copy when a google-chrome update changes the
+original.
 
 ## Run
 
