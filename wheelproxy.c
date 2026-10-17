@@ -18,10 +18,13 @@
 #include <unistd.h>
 
 enum { IN_CAP = 1 << 17, OUT_HIGH = 1 << 22, FD_CAP = 256, MAX_FDS = 28, MAX_POINTERS = 8, ID_MAX = (1 << 22) - 1, CONNECT_RETRIES = 11 };
-enum { K_NONE, K_REGISTRY, K_SEAT, K_POINTER };
+enum { K_NONE, K_REGISTRY, K_SEAT, K_POINTER, K_KEYBOARD };
 enum { W_LISTEN, W_SIGNAL, W_CLIENT, W_SERVER, W_TIMER };
 enum { AXIS_VERTICAL = 0, SOURCE_WHEEL = 0 };
 enum { PTR_RELEASE = 1, PTR_LEAVE = 1, PTR_AXIS = 4, PTR_FRAME = 5, PTR_SOURCE = 6, PTR_V120 = 9 };
+enum { SEAT_GET_KEYBOARD = 1, KBD_LEAVE = 2, KBD_MODIFIERS = 4 };
+// xkb real modifier bits for control, mod1 and mod4, the usual ctrl alt and super
+enum { CMD_MODS = 0x4 | 0x8 | 0x40 };
 
 struct opts {
     const char *listen, *upstream;
@@ -44,7 +47,7 @@ struct pointer {
     uint32_t id, version, time;
     double remaining, pos, time_at, started;
     bool absorbed;
-    int notches, steps, sent;
+    int notches, passed, steps, sent;
 };
 
 struct conn;
@@ -64,6 +67,7 @@ struct conn {
     size_t ids;
     struct pointer ptr[MAX_POINTERS];
     int nptr;
+    uint32_t mods;
     struct timespec last_tick;
     struct conn *next;
 };
@@ -101,15 +105,17 @@ static void kill_conn(struct conn *c, const char *reason, int err)
     if (c->dead)
         return;
     c->dead = true;
-    int notches = 0;
-    for (int i = 0; i < c->nptr; i++)
+    int notches = 0, passed = 0;
+    for (int i = 0; i < c->nptr; i++) {
         notches += c->ptr[i].notches;
+        passed += c->ptr[i].passed;
+    }
     fprintf(stderr,
             "[conn] close id=%d reason=%s errno=%s ms=%.0f bytes_up=%llu bytes_down=%llu queued_up=%zu "
-            "queued_down=%zu fds_up=%d fds_down=%d notches=%d retries=%d\n",
+            "queued_down=%zu fds_up=%d fds_down=%d notches=%d passed=%d retries=%d\n",
             c->id, reason, errname(err), mono_ms() - c->opened, (unsigned long long)c->up.bytes,
             (unsigned long long)c->down.bytes, c->up.out_len, c->down.out_len, c->up.nfds, c->down.nfds, notches,
-            c->retries);
+            passed, c->retries);
 }
 
 static void put(struct conn *c, struct dir *d, const void *p, size_t n)
@@ -218,6 +224,11 @@ static void on_request(struct conn *c, const uint8_t *m, uint32_t size)
         c->ptr[c->nptr++] = (struct pointer){.id = id, .version = c->ver[obj]};
         if (opt.verbose)
             fprintf(stderr, "[pointer] track id=%d pointer=%u version=%u\n", c->id, id, c->ver[obj]);
+    } else if (kind_of(c, obj) == K_SEAT && op == SEAT_GET_KEYBOARD && size >= 12) {
+        uint32_t id = rd32(m + 8);
+        set_kind(c, id, K_KEYBOARD, c->ver[obj]);
+        if (opt.verbose)
+            fprintf(stderr, "[keyboard] track id=%d keyboard=%u version=%u\n", c->id, id, c->ver[obj]);
     } else if (kind_of(c, obj) == K_POINTER && op == PTR_RELEASE) {
         drop_pointer(c, obj, "release");
     }
@@ -299,6 +310,13 @@ static bool on_pointer_event(struct conn *c, struct pointer *p, const uint8_t *m
 {
     uint32_t op = rd32(m + 4) & 0xffff;
     if (op == PTR_V120 && size >= 16 && p->version >= 8 && rd32(m + 8) == AXIS_VERTICAL) {
+        if (c->mods & CMD_MODS) {
+            p->passed++;
+            if (opt.verbose)
+                fprintf(stderr, "[wheel] passthrough pointer=%u v120=%d mods=0x%x\n", p->id, (int32_t)rd32(m + 12),
+                        c->mods);
+            return true;
+        }
         absorb(p, (int32_t)rd32(m + 12));
         return false;
     }
@@ -321,6 +339,19 @@ static bool on_pointer_event(struct conn *c, struct pointer *p, const uint8_t *m
     return true;
 }
 
+// leftover glide would otherwise land as ctrl+wheel
+static void on_keyboard_event(struct conn *c, uint32_t op, const uint8_t *m, uint32_t size)
+{
+    if (op == KBD_LEAVE)
+        c->mods = 0;
+    if (op != KBD_MODIFIERS || size < 28)
+        return;
+    c->mods = rd32(m + 12) | rd32(m + 16) | rd32(m + 20);
+    if (c->mods & CMD_MODS)
+        for (int i = 0; i < c->nptr; i++)
+            c->ptr[i].remaining = 0;
+}
+
 static void on_event(struct conn *c, const uint8_t *m, uint32_t size)
 {
     uint32_t obj = rd32(m), op = rd32(m + 4) & 0xffff;
@@ -333,6 +364,8 @@ static void on_event(struct conn *c, const uint8_t *m, uint32_t size)
         struct pointer *p = find_pointer(c, obj);
         if (p && !on_pointer_event(c, p, m, size))
             return;
+    } else if (kind_of(c, obj) == K_KEYBOARD) {
+        on_keyboard_event(c, op, m, size);
     }
     put(c, &c->down, m, size);
 }
@@ -709,14 +742,14 @@ static void dump_state(void)
     for (struct conn *c = conns; c; c = c->next) {
         fprintf(stderr,
                 "[state] conn id=%d ms=%.0f bytes_up=%llu bytes_down=%llu queued_up=%zu queued_down=%zu fds_up=%d "
-                "fds_down=%d pointers=%d ticking=%d connecting=%d retries=%d\n",
+                "fds_down=%d pointers=%d mods=0x%x ticking=%d connecting=%d retries=%d\n",
                 c->id, mono_ms() - c->opened, (unsigned long long)c->up.bytes, (unsigned long long)c->down.bytes,
-                c->up.out_len, c->down.out_len, c->up.nfds, c->down.nfds, c->nptr, c->ticking, c->connecting,
+                c->up.out_len, c->down.out_len, c->up.nfds, c->down.nfds, c->nptr, c->mods, c->ticking, c->connecting,
                 c->retries);
         for (int i = 0; i < c->nptr; i++) {
             struct pointer *p = &c->ptr[i];
-            fprintf(stderr, "[state] pointer id=%d pointer=%u version=%u remaining=%.1f notches=%d\n", c->id, p->id,
-                    p->version, p->remaining, p->notches);
+            fprintf(stderr, "[state] pointer id=%d pointer=%u version=%u remaining=%.1f notches=%d passed=%d\n",
+                    c->id, p->id, p->version, p->remaining, p->notches, p->passed);
         }
     }
 }

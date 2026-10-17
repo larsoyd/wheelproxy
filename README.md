@@ -27,6 +27,9 @@ connects to the proxy's socket instead of the compositor's.
 - Reversing the wheel direction drops whatever is still pending, and so does the pointer leaving the window.
 - Touchpad scrolling (finger and continuous sources), horizontal wheel scrolling and all other traffic pass
   through unchanged.
+- While Ctrl, Alt or Super is held, wheel notches pass through unsmoothed, so page zoom and extensions that
+  act once per wheel event (such as playback speed controls) get one event per notch. Pressing one of them
+  drops whatever is still pending. Shift+wheel stays smooth.
 
 Why this works on the browser side, for anyone curious (Chromium source, `ui/` and `cc/`):
 

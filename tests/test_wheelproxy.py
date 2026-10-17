@@ -15,8 +15,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BIN = os.path.join(ROOT, "build", "wheelproxy")
 
 POINTER = 4
+KEYBOARD = 5
 WHEEL, FINGER = 0, 1
 VERTICAL, HORIZONTAL = 0, 1
+SHIFT, CAPS, CTRL, ALT, NUM, SUPER = 0x1, 0x2, 0x4, 0x8, 0x10, 0x40
 
 
 STRACE = ["strace", "-f", "-qq", "-o", "/dev/null"]
@@ -46,6 +48,10 @@ def parse(data):
 def wheel_frame(n, axis=VERTICAL, source=WHEEL):
     return (msg(POINTER, 6, source) + msg(POINTER, 9, axis, n)
             + msg(POINTER, 4, 1000, axis, n * 256 // 8) + msg(POINTER, 5))
+
+
+def modifiers(depressed, latched=0, locked=0, obj=KEYBOARD):
+    return msg(obj, 4, 30, depressed, latched, locked, 0)
 
 
 def send_fds(sock, data, fds):
@@ -207,6 +213,11 @@ class Proxy(unittest.TestCase):
         client.sendall(setup)
         self.assertEqual(setup, read_exact(server, len(setup)), "log=" + self.logtext())
 
+    def add_keyboard(self):
+        get = msg(3, 1, KEYBOARD)
+        self.client.sendall(get)
+        self.assertEqual(get, read_exact(self.server, len(get)), "log=" + self.logtext())
+
     def events_after(self, data, seconds=1.0, quiet=0.15):
         self.server.sendall(data)
         return timed_events(read_for(self.client, seconds, quiet))
@@ -300,7 +311,7 @@ class Lifecycle(Proxy):
         self.client.close()
         self.wait_log("[conn] close id=1 reason=client_hangup errno=none ms=")
         log = self.logtext()
-        self.assertIn("queued_up=0 queued_down=0 fds_up=0 fds_down=0 notches=0 retries=0", log)
+        self.assertIn("queued_up=0 queued_down=0 fds_up=0 fds_down=0 notches=0 passed=0 retries=0", log)
         self.assertLess(int(log.split(" ms=")[1].split()[0]), 5000, log)
 
     def test_sigterm_logs_why_it_stopped(self):
@@ -316,10 +327,10 @@ class Debug(Proxy):
         os.kill(self.proc.pid, signal.SIGUSR1)
         self.wait_log("[state] conns=1 served=1")
         log = self.logtext()
-        self.assertIn("queued_up=0 queued_down=0 fds_up=0 fds_down=0 pointers=1 ticking=0 connecting=0 retries=0",
-                      log)
+        self.assertIn("queued_up=0 queued_down=0 fds_up=0 fds_down=0 pointers=1 mods=0x0 ticking=0 connecting=0 "
+                      "retries=0", log)
         self.assertIn("[state] conn id=1 ms=", log)
-        self.assertIn("[state] pointer id=1 pointer=4 version=9 remaining=0.0 notches=0", log)
+        self.assertIn("[state] pointer id=1 pointer=4 version=9 remaining=0.0 notches=0 passed=0", log)
         self.client.sendall(msg(5, 0, 1))
         self.assertEqual(msg(5, 0, 1), read_exact(self.server, 12))
 
@@ -476,6 +487,73 @@ class Smoothing(Proxy):
         self.assertGreater(len(values), 1, "values=%r" % values)
 
 
+class Modifiers(Proxy):
+    def setUp(self):
+        super().setUp()
+        self.add_keyboard()
+
+    def assert_raw(self, before):
+        want = before + wheel_frame(120)
+        self.server.sendall(want)
+        self.assertEqual(want, read_exact(self.client, len(want)), "log=" + self.logtext())
+        late = timed_events(read_for(self.client, 0.1))
+        self.assertEqual([], v120_values(late), "late=%r" % late)
+
+    def assert_smoothed(self, before):
+        values = v120_values(self.events_after(before + wheel_frame(120)))
+        self.assertEqual(240, sum(values), "values=%r log=%s" % (values, self.logtext()))
+        self.assertGreater(len(values), 1, "values=%r" % values)
+
+    def test_ctrl_notch_passes_through_unchanged(self):
+        self.assert_raw(modifiers(CTRL))
+
+    def test_alt_and_super_notches_pass_through(self):
+        for mask in (ALT, SUPER, CTRL | SHIFT | NUM):
+            with self.subTest(mods=hex(mask)):
+                self.assert_raw(modifiers(mask))
+
+    def test_latched_and_locked_ctrl_pass_through(self):
+        self.assert_raw(modifiers(0, latched=CTRL))
+        self.assert_raw(modifiers(0, locked=CTRL))
+
+    def test_shift_and_locks_still_smooth(self):
+        self.assert_smoothed(modifiers(SHIFT, latched=SHIFT, locked=CAPS | NUM))
+
+    def test_ctrl_pressed_mid_glide_drops_the_rest(self):
+        self.server.sendall(wheel_frame(120))
+        early = timed_events(read_for(self.client, 0.012))
+        events = early + self.events_after(modifiers(CTRL))
+        objs = [(o, op) for _, o, op, _ in events]
+        after = objs[objs.index((KEYBOARD, 4)) + 1:]
+        self.assertNotIn((POINTER, 9), after, "early=%d after=%r" % (len(early), after))
+        self.assertLess(sum(v120_values(events)), 240, "values=%r" % v120_values(events))
+
+    def test_released_ctrl_smooths_again(self):
+        self.server.sendall(modifiers(CTRL))
+        self.assertEqual(modifiers(CTRL), read_exact(self.client, len(modifiers(CTRL))))
+        self.assert_smoothed(modifiers(0))
+
+    def test_keyboard_leave_clears_modifiers(self):
+        self.assert_smoothed(modifiers(CTRL) + msg(KEYBOARD, 2, 31, 9))
+
+    def test_modifiers_on_other_objects_are_ignored(self):
+        self.assert_smoothed(modifiers(CTRL, obj=9) + modifiers(CTRL, obj=POINTER))
+
+    def test_deleted_keyboard_id_is_untracked(self):
+        self.server.sendall(msg(1, 1, KEYBOARD))
+        self.assertEqual(msg(1, 1, KEYBOARD), read_exact(self.client, 12))
+        self.assert_smoothed(modifiers(CTRL))
+
+    def test_passed_notches_are_counted(self):
+        self.assert_raw(modifiers(CTRL))
+        os.kill(self.proc.pid, signal.SIGUSR1)
+        self.wait_log("[state] pointer id=1 pointer=4 version=9 remaining=0.0 notches=0 passed=1")
+        self.assertIn("pointers=1 mods=0x4 ticking=0", self.logtext())
+        self.client.close()
+        self.wait_log("[conn] close id=1 reason=client_hangup")
+        self.assertIn("notches=0 passed=1 retries=0", self.logtext())
+
+
 class Verbose(Proxy):
     args = Proxy.args + ["--verbose"]
 
@@ -495,6 +573,13 @@ class Verbose(Proxy):
         self.server.sendall(msg(1, 1, POINTER))
         self.assertEqual(msg(1, 1, POINTER), read_exact(self.client, 12))
         self.wait_log("[pointer] drop id=1 pointer=4 reason=delete_id")
+
+    def test_keyboard_and_passthrough_are_logged(self):
+        self.add_keyboard()
+        self.wait_log("[keyboard] track id=1 keyboard=5 version=9")
+        self.events_after(modifiers(CTRL | SHIFT) + wheel_frame(-120))
+        self.wait_log("[wheel] passthrough pointer=4 v120=-120 mods=0x5")
+        self.assertNotIn("[wheel] pointer=4", self.logtext())
 
     def test_release_is_logged(self):
         self.client.sendall(msg(POINTER, 1))
