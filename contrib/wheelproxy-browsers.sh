@@ -111,9 +111,65 @@ list() {
     done | sort
 }
 
+pick() {
+    local tok i
+    local -a toks
+    local -A want=()
+    IFS=, read -ra toks <<< "$1"
+    for tok in "${toks[@]}"; do
+        tok=${tok//[[:space:]]/}
+        [ -z "$tok" ] && continue
+        if [[ ! $tok =~ ^[0-9]+$ ]]; then
+            echo "[browsers] invalid answer=$tok reason=not_a_number max=${#keys[@]}" >&2
+            return 1
+        fi
+        if [ ${#tok} -gt 4 ] || [ $((10#$tok)) -lt 1 ] || [ $((10#$tok)) -gt ${#keys[@]} ]; then
+            echo "[browsers] invalid answer=$tok reason=out_of_range max=${#keys[@]}" >&2
+            return 1
+        fi
+        want[$((10#$tok))]=1
+    done
+    if [ ${#want[@]} -eq 0 ]; then
+        echo "[browsers] invalid answer=(none) reason=empty max=${#keys[@]}" >&2
+        return 1
+    fi
+    for i in "${!keys[@]}"; do
+        [ -n "${want[$((i + 1))]:-}" ] && echo "${keys[i]}"
+    done
+    return 0
+}
+
+choose() {
+    local i answer attempt
+    local -a rows keys=()
+    mapfile -t rows < <(list)
+    if [ ${#rows[@]} -eq 0 ]; then
+        echo "[browsers] refused reason=no_browsers apps=$apps" >&2
+        exit 1
+    fi
+    echo "Chromium-based browsers on this system:" >&2
+    for i in "${!rows[@]}"; do
+        keys[i]=${rows[i]%%$'\t'*}
+        printf '  %d) %s (%s)\n' $((i + 1)) "${rows[i]#*$'\t'}" "${keys[i]}" >&2
+    done
+    for attempt in 1 2 3; do
+        printf 'Route which browsers through wheelproxy? Numbers separated by commas, attempt %d of 3: ' "$attempt" >&2
+        if ! IFS= read -r answer; then
+            echo >&2
+            echo "[browsers] refused reason=no_answer" >&2
+            exit 2
+        fi
+        pick "$answer" && exit 0
+    done
+    echo "[browsers] refused reason=no_valid_answer attempts=3" >&2
+    exit 2
+}
+
 case "${1:-}" in
     list)
         list ;;
+    choose)
+        choose ;;
     apply)
         load_config
         for f in "$apps"/*.desktop; do
@@ -131,7 +187,7 @@ case "${1:-}" in
             rewrite "$f" "s|$wrapped|Exec=|" && echo "[browsers] restored entry=${f##*/} reason=revert" >&2
         done ;;
     *)
-        echo "[browsers] refused reason=unknown_command command=${1:-(none)} usage=list|apply|hook|revert" >&2
+        echo "[browsers] refused reason=unknown_command command=${1:-(none)} usage=list|choose|apply|hook|revert" >&2
         exit 2 ;;
 esac
 exit $status

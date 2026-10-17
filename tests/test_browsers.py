@@ -259,6 +259,39 @@ class Browsers(unittest.TestCase):
         err = self.run_tool("frobnicate", code=2).stderr
         self.assertIn("[browsers] refused reason=unknown_command command=frobnicate", err)
 
+    def test_choose_prints_the_picked_browsers(self):
+        self.standard()
+        res = self.run_tool("choose", stdin="2\n")
+        self.assertEqual("google-chrome\n", res.stdout)
+        self.assertIn("  1) Chromium (chromium)\n  2) Google Chrome (google-chrome)\n", res.stderr)
+
+    def test_choose_takes_a_comma_list_in_menu_order_once_each(self):
+        self.standard()
+        res = self.run_tool("choose", stdin=" 2 ,1,,2\n")
+        self.assertEqual("chromium\ngoogle-chrome\n", res.stdout)
+
+    def test_choose_asks_again_after_a_bad_answer(self):
+        self.standard()
+        res = self.run_tool("choose", stdin="3\nfoo\n,\n1\n", code=2)
+        self.assertIn("[browsers] invalid answer=3 reason=out_of_range max=2", res.stderr)
+        self.assertIn("[browsers] invalid answer=foo reason=not_a_number max=2", res.stderr)
+        self.assertIn("[browsers] refused reason=no_valid_answer attempts=3", res.stderr)
+        self.assertEqual("", res.stdout)
+        res = self.run_tool("choose", stdin="0\n1\n")
+        self.assertIn("[browsers] invalid answer=0 reason=out_of_range max=2", res.stderr)
+        self.assertEqual("chromium\n", res.stdout)
+
+    def test_choose_without_an_answer_is_refused(self):
+        self.standard()
+        res = self.run_tool("choose", stdin="", code=2)
+        self.assertIn("[browsers] refused reason=no_answer", res.stderr)
+        self.assertEqual("", res.stdout)
+
+    def test_choose_without_browsers_is_refused(self):
+        self.package("firefox", {"firefox.desktop": FIREFOX}, b"\x7fELF\x02\x01")
+        res = self.run_tool("choose", stdin="1\n", code=1)
+        self.assertIn("[browsers] refused reason=no_browsers apps=" + self.apps, res.stderr)
+
     def test_hook_file_runs_the_tool_on_installed_entries(self):
         with open(HOOK) as f:
             text = f.read()

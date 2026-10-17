@@ -1,0 +1,15 @@
+post_install() {
+    wheelproxy-browsers apply
+    systemctl --global enable wheelproxy.service
+    echo ':: start the proxy now with: systemctl --user start wheelproxy.service'
+    echo ':: then quit the browser and open it again from the application menu'
+}
+
+post_upgrade() {
+    wheelproxy-browsers apply
+}
+
+pre_remove() {
+    wheelproxy-browsers revert
+    systemctl --global disable wheelproxy.service
+}

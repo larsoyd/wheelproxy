@@ -53,6 +53,34 @@ send `wl_pointer.axis_value120` (Wayland 1.21 and later), but only KWin has been
   testing. If yours runs under XWayland, add `--ozone-platform=wayland`.
 - A C compiler, `make`, and Python 3 for the tests and the launcher's proxy check.
 
+## Install on Arch Linux
+
+```sh
+cd packaging/wheelproxy-git
+makepkg -si
+```
+
+Before building, it lists the Chromium-based browsers installed on this system and asks which ones to route
+through the proxy. Answer with their numbers separated by commas, for example `1,3`. The package installs the
+proxy and launcher in `/usr/bin`, a user service enabled for every user, and a pacman hook.
+
+The choice is kept in `/etc/wheelproxy/browsers`, one pacman package name per line, or `all`. Edit it and run
+`sudo wheelproxy-browsers apply` to change it later.
+
+The hook runs whenever pacman installs or updates a desktop entry. If the entry belongs to a web browser whose
+package contains a Chromium build, and that browser is selected, every `Exec=` line in the entry is prefixed
+with `/usr/bin/wheelproxy-launch`. A browser counts as Chromium-based when its desktop entry declares it a web
+browser and one of its package's executables knows Chromium's `disable-smooth-scrolling` switch, so Firefox
+and Electron apps are left alone. Package updates replace the entry and the hook routes it again. Removing the
+package restores the entries.
+
+Start the proxy once with `systemctl --user start wheelproxy.service` (it starts by itself from the next
+login), then quit the browser and open it from the application menu.
+
+Remove an older `make install` before installing the package: it puts a copy of the browser's menu entry in
+`~/.local/share/applications` that hides the system entry, and a service of the same name in
+`~/.config/systemd/user` that takes precedence over the packaged one.
+
 ## Install for Google Chrome
 
 ```sh
