@@ -416,6 +416,39 @@ class Defaults(Proxy):
         self.assertLess(half, 0.075, "half=%.3f" % half)
 
 
+    def steps(self, notch=120):
+        events = [(o, op, b) for _, o, op, b in self.events_after(wheel_frame(notch), seconds=1.5, quiet=0.3)
+                  if o == POINTER]
+        out = []
+        for i, (o, op, b) in enumerate(events):
+            if op == 9:
+                n = struct.unpack_from("<Ii", b)[1]
+                out.append((struct.unpack_from("<I", events[i + 1][2])[0], n))
+        return out
+
+    def test_tail_decelerates_to_a_stop(self):
+        steps = self.steps()
+        reached, total = [], 0
+        for t, n in steps:
+            for _ in range(n):
+                total += 1
+                reached.append(t)
+        self.assertEqual(198, total)
+        early = reached[-8] - reached[-11]
+        late = reached[-1] - reached[-4]
+        self.assertGreater(late, 1.8 * early, "ms for 3px early=%d late=%d steps=%r" % (early, late, steps))
+
+    def test_notch_finishes_without_a_long_tail(self):
+        times = [t for t, _ in self.steps()]
+        self.assertLess(times[-1] - times[0], 330, "first=%d last=%d" % (times[0], times[-1]))
+
+    def test_steps_are_finer_than_a_display_frame(self):
+        times = [t for t, _ in self.steps()]
+        first = [b - a for a, b in zip(times, times[1:]) if b - times[0] < 100]
+        first.sort()
+        self.assertLessEqual(first[len(first) // 2], 2, "intervals=%r" % first)
+
+
 class MissingUpstream(Proxy):
     upstream_name = "wayland-gone"
 

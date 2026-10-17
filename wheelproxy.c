@@ -42,9 +42,9 @@ struct dir {
 
 struct pointer {
     uint32_t id, version, time;
-    double remaining, carry, started;
+    double remaining, pos, time_at, started;
     bool absorbed;
-    int notches, steps;
+    int notches, steps, sent;
 };
 
 struct conn;
@@ -67,7 +67,8 @@ struct conn {
     struct conn *next;
 };
 
-static struct opts opt = {.mult = 1.65, .tau_ms = 70, .tick_ms = 4, .listen = "wayland-smooth"};
+static struct opts opt = {.mult = 1.65, .tau_ms = 70, .tick_ms = 1, .listen = "wayland-smooth"};
+static const double TAIL_PX = 4;
 static int epfd;
 static struct conn *conns;
 
@@ -196,15 +197,16 @@ static void arm(struct conn *c, bool on)
     c->ticking = on;
 }
 
+// aim past the target so the curve still decelerates when it lands
 static int step(struct pointer *p, double dt)
 {
-    double want = p->remaining * (1 - exp(-dt / opt.tau_ms));
-    if (fabs(want) < 1)
-        want = copysign(fmin(1, fabs(p->remaining)), p->remaining);
+    double want = (p->remaining + copysign(TAIL_PX, p->remaining)) * (1 - exp(-dt / opt.tau_ms));
+    if (fabs(want) >= fabs(p->remaining))
+        want = p->remaining;
     p->remaining -= want;
-    double total = want + p->carry;
-    int n = (int)lround(total);
-    p->carry = p->remaining ? total - n : 0;
+    p->pos += want;
+    int n = (int)lround(p->pos) - p->sent;
+    p->sent += n;
     return n;
 }
 
@@ -222,10 +224,10 @@ static void tick(struct conn *c, double dt)
             fprintf(stderr, "[wheel] settled pointer=%u steps=%d ms=%.1f\n", p->id, p->steps, mono_ms() - p->started);
         if (!n)
             continue;
-        p->time += (uint32_t)dt;
+        uint32_t when = p->time + (uint32_t)lround(mono_ms() - p->time_at);
         put_event(c, p->id, PTR_SOURCE, (uint32_t[]){SOURCE_WHEEL}, 1);
         put_event(c, p->id, PTR_V120, (uint32_t[]){AXIS_VERTICAL, (uint32_t)n}, 2);
-        put_event(c, p->id, PTR_AXIS, (uint32_t[]){p->time, AXIS_VERTICAL, (uint32_t)(n * 32)}, 3);
+        put_event(c, p->id, PTR_AXIS, (uint32_t[]){when, AXIS_VERTICAL, (uint32_t)(n * 32)}, 3);
         put_event(c, p->id, PTR_FRAME, NULL, 0);
     }
     if (busy != c->ticking)
@@ -236,10 +238,11 @@ static void absorb(struct pointer *p, int32_t v120)
 {
     double add = v120 * opt.mult;
     if (p->remaining && (add > 0) != (p->remaining > 0))
-        p->remaining = p->carry = 0;
+        p->remaining = 0;
     if (!p->remaining) {
         p->started = mono_ms();
-        p->steps = 0;
+        p->steps = p->sent = 0;
+        p->pos = 0;
     }
     p->remaining += add;
     p->absorbed = true;
@@ -257,10 +260,11 @@ static bool on_pointer_event(struct conn *c, struct pointer *p, const uint8_t *m
     }
     if (op == PTR_AXIS && size >= 20) {
         p->time = rd32(m + 8);
+        p->time_at = mono_ms();
         return !(p->absorbed && rd32(m + 12) == AXIS_VERTICAL);
     }
     if (op == PTR_LEAVE)
-        p->remaining = p->carry = 0;
+        p->remaining = 0;
     if (op == PTR_FRAME && p->absorbed) {
         p->absorbed = false;
         put(c, &c->down, m, size);

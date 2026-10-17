@@ -19,9 +19,11 @@ connects to the proxy's socket instead of the compositor's.
 - It tracks `wl_seat` bindings and `wl_pointer` objects. When the compositor sends a vertical
   `wl_pointer.axis_value120` wheel event, the proxy removes it and the matching `wl_pointer.axis` event from
   that frame.
-- The notch, scaled by `--mult`, is added to a pending distance. The proxy sends the pending distance on in
-  complete pointer frames every 4 ms: `axis_source`, `axis_value120`, `axis`, `frame`. Each frame carries a
-  fixed fraction of what is left, an exponential decay with time constant `--tau-ms`.
+- The notch, scaled by `--mult`, is added to a pending distance. Every millisecond the proxy moves a fixed
+  fraction of what is left (time constant `--tau-ms`). It aims a few pixels past the target, so the motion
+  is still slowing down when it lands instead of creeping at the end. Whole pixels are sent on as complete
+  pointer frames: `axis_source`, `axis_value120`, `axis`, `frame`. Stepping much faster than the display
+  refresh gives every frame an even share of the motion.
 - Reversing the wheel direction drops whatever is still pending, and so does the pointer leaving the window.
 - Touchpad scrolling (finger and continuous sources), horizontal wheel scrolling and all other traffic pass
   through unchanged.
@@ -114,8 +116,8 @@ it is given, which for `flatpak run` is not the browser, and the sandbox may not
 
 ## Tuning
 
-The defaults are `--mult 1.65 --tau-ms 70`: about 198 px per notch, half of it covered in roughly 50 ms and
-90 % in about 160 ms. To change them, edit `ExecStart=` in `~/.config/systemd/user/wheelproxy.service`.
+The defaults are `--mult 1.65 --tau-ms 70`: about 198 px per notch, half of it covered in roughly 50 ms,
+90 % in about 150 ms, and done after about 275 ms. To change them, edit `ExecStart=` in `~/.config/systemd/user/wheelproxy.service`.
 
 | flag | default | meaning |
 |------|---------|---------|
@@ -123,7 +125,7 @@ The defaults are `--mult 1.65 --tau-ms 70`: about 198 px per notch, half of it c
 | `--upstream` | `$WAYLAND_DISPLAY` | the compositor socket |
 | `--mult` | `1.65` | distance multiplier, where one notch is 120 px at 1.0 |
 | `--tau-ms` | `70` | decay time constant: lower is snappier, higher glides longer |
-| `--tick-ms` | `4` | interval between steps while a scroll is running |
+| `--tick-ms` | `1` | interval between steps while a scroll is running |
 | `--verbose` | off | log every notch and the end of every scroll |
 
 Then apply them:
