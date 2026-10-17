@@ -4,7 +4,7 @@ PartOf=graphical-session.target
 After=graphical-session.target
 
 [Service]
-ExecStart=%h/.local/bin/wheelproxy --listen wayland-smooth --mult 1.65 --tau-ms 70
+ExecStart=%h/.local/bin/wheelproxy --listen wayland-smooth
 Restart=on-failure
 RestartSec=1
 

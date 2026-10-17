@@ -1,45 +1,169 @@
 # wheelproxy
 
-A small Wayland proxy that gives Chromium-based browsers smooth, responsive mouse-wheel scrolling on Linux.
+Responsive, smooth mouse-wheel scrolling for Chromium-based browsers on Wayland.
 
-Chrome animates each wheel notch with a 200 ms ease-in-out curve, so a page barely moves during the first
-50 ms. wheelproxy sits between the browser and the compositor. It absorbs each vertical wheel notch and
-replays it as a stream of small high-resolution wheel steps that front-load the distance and then decay
-exponentially. Run the browser with its own smooth scrolling turned off so these steps apply directly.
+Chromium animates every mouse-wheel notch with a fixed ease-in-out curve that lasts about 200 ms and starts
+slowly: about 1.4 % of the distance is covered after one 60 Hz frame and 13 % after 50 ms. Scrolling feels
+sluggish next to Firefox, especially on high refresh rate screens. wheelproxy is a small Wayland proxy that
+sits between the browser and the compositor. It turns each wheel notch into a stream of small
+high-resolution scroll steps that front-load the distance and then glide out. Chromium's own smooth scrolling
+is switched off, so each step applies on the next frame.
 
-Everything else on the connection, file descriptors included, passes through byte for byte. Touchpad
-(finger and continuous) scrolling and horizontal wheel scrolling are not changed.
+No browser patching or rebuild is needed, and it does not use `LD_PRELOAD`. The browser runs unchanged and
+connects to the proxy's socket instead of the compositor's.
 
-## Build
+## How it works
 
-    make
-    make test
-    make install            # binary and launcher to ~/.local/bin, user service to ~/.config/systemd/user
-    systemctl --user enable --now wheelproxy.service
+- The browser connects to `$XDG_RUNTIME_DIR/wayland-smooth`. The proxy opens a matching connection to the
+  real compositor and forwards both directions byte for byte, file descriptors included.
+- It tracks `wl_seat` bindings and `wl_pointer` objects. When the compositor sends a vertical
+  `wl_pointer.axis_value120` wheel event, the proxy removes it and the matching `wl_pointer.axis` event from
+  that frame.
+- The notch, scaled by `--mult`, is added to a pending distance. The proxy sends the pending distance on in
+  complete pointer frames every 4 ms: `axis_source`, `axis_value120`, `axis`, `frame`. Each frame carries a
+  fixed fraction of what is left, an exponential decay with time constant `--tau-ms`.
+- Reversing the wheel direction drops whatever is still pending, and so does the pointer leaving the window.
+- Touchpad scrolling (finger and continuous sources), horizontal wheel scrolling and all other traffic pass
+  through unchanged.
 
-`google-chrome-smooth` starts Chrome through the proxy with smooth scrolling off. If the proxy is not
-answering, it starts Chrome directly instead. `make install` also writes a copy of Chrome's desktop entry to
-`~/.local/share/applications` with its Exec lines pointing at the launcher. An autostart entry runs
-`wheelproxy-refresh-desktop` at each login to regenerate that copy when a google-chrome update changes the
-original.
+Why this works on the browser side, for anyone curious (Chromium source, `ui/` and `cc/`):
 
-## Run
+- `ui/ozone/platform/wayland/host/wayland_pointer.cc` converts `axis_value120` one to one into pixels (120
+  per notch). `wayland_event_source.cc` builds a wheel event from it without the precise-delta flag, so Blink
+  animates it.
+- `cc/animation/scroll_offset_animation_curve_factory.cc` uses the `kInverseDelta` duration for mouse
+  wheels, which is 12 frames at 60 Hz (200 ms) for any step up to 120 px, with an ease-in-out curve.
+- With `--disable-smooth-scrolling`, every wheel event applies directly. Feeding the browser many small
+  steps then gives a curve the proxy controls.
 
-    wheelproxy --listen wayland-smooth --upstream "$WAYLAND_DISPLAY" --mult 1.33 --tau-ms 45
-    WAYLAND_DISPLAY=wayland-smooth google-chrome-stable --ozone-platform=wayland --disable-smooth-scrolling
+## Status
 
-| flag          | default            | meaning                                                   |
-|---------------|--------------------|-----------------------------------------------------------|
-| `--listen`    | `wayland-smooth`   | socket name in `$XDG_RUNTIME_DIR`, or an absolute path     |
-| `--upstream`  | `$WAYLAND_DISPLAY` | the real compositor socket                                 |
-| `--mult`      | `1`                | distance multiplier per notch (one notch is 120 px × the compositor's scroll factor) |
-| `--tau-ms`    | `45`               | decay time constant: lower is snappier, higher is smoother |
-| `--tick-ms`   | `4`                | step interval while a scroll is animating                  |
-| `--verbose`   | off                | log each notch and when each animation settles             |
+Tested on KDE Plasma 6 (KWin, Wayland) with Google Chrome 155 and Chromium 154 on Arch Linux.
 
-If the proxy stops, every client connected through it loses its display connection.
+Other Chromium-based browsers (Brave, Vivaldi, Microsoft Edge, Opera and others) share Chromium's Wayland
+input code and should behave the same, but they have not been tested. Other compositors should work if they
+send `wl_pointer.axis_value120` (Wayland 1.21 and later), but only KWin has been tested.
 
 ## Requirements
 
-A compositor that supports `wl_pointer` version 8 or later (high-resolution wheel events). The browser
-must bind `wl_seat` at version 8 or later. Chrome does.
+- A Wayland session whose compositor supports `wl_pointer` version 8.
+- The browser running as a native Wayland client. Google Chrome 155 and Chromium 154 did this by default in
+  testing. If yours runs under XWayland, add `--ozone-platform=wayland`.
+- A C compiler, `make`, and Python 3 for the tests and the launcher's proxy check.
+
+## Install for Google Chrome
+
+```sh
+make
+make test
+make install-desktop
+systemctl --user enable --now wheelproxy.service
+```
+
+Then quit the browser completely and start it again from the application menu.
+
+`make install` puts these files in place:
+
+| file | purpose |
+|------|---------|
+| `~/.local/bin/wheelproxy` | the proxy |
+| `~/.local/bin/wheelproxy-launch` | starts a browser through the proxy with `--disable-smooth-scrolling` |
+| `~/.local/bin/wheelproxy-desktop` | writes menu entry overrides that start the browser through the launcher |
+| `~/.config/systemd/user/wheelproxy.service` | runs the proxy for your graphical session |
+
+`make install-desktop` also writes `~/.local/share/applications/google-chrome.desktop`. That is a copy of the
+system entry with every `Exec=` line prefixed by `wheelproxy-launch`. It also adds an autostart entry that
+runs `wheelproxy-desktop` at each login, so the copy is regenerated whenever a browser update changes the
+original. A short notification appears when that happens.
+
+If the proxy is not running, `wheelproxy-launch` starts the browser directly with its normal settings, so
+the browser always opens.
+
+## Other Chromium-based browsers
+
+Any browser whose launcher accepts Chromium's command-line flags can be routed the same way. Only Google
+Chrome and Chromium have been tested.
+
+1. Try it once from a terminal, with the service running:
+
+   ```sh
+   wheelproxy-launch brave --new-window
+   ```
+
+   Use your browser's command, for example `chromium`, `brave`, `vivaldi-stable`, `microsoft-edge-stable`
+   or `opera`. Quit any running instance first: a browser that is already running only opens a new window in
+   the existing process, which is still connected directly. The launcher prints `[launcher] via=proxy` when
+   the proxy is used.
+
+2. To make it permanent, find the browser's desktop entry name:
+
+   ```sh
+   ls /usr/share/applications | grep -i brave
+   ```
+
+3. Install the override and the login check for every browser you use, separated by spaces:
+
+   ```sh
+   make install-desktop ENTRIES="google-chrome.desktop chromium.desktop brave-browser.desktop"
+   ```
+
+Entry names vary between distributions and packages, so use the names step 2 printed.
+
+Flatpak and Snap builds are untested. The launcher passes `--disable-smooth-scrolling` to the first command
+it is given, which for `flatpak run` is not the browser, and the sandbox may not expose the proxy socket.
+
+## Tuning
+
+The defaults are `--mult 1.65 --tau-ms 70`: about 198 px per notch, half of it covered in roughly 50 ms and
+90 % in about 160 ms. To change them, edit `ExecStart=` in `~/.config/systemd/user/wheelproxy.service`.
+
+| flag | default | meaning |
+|------|---------|---------|
+| `--listen` | `wayland-smooth` | socket name in `$XDG_RUNTIME_DIR`, or an absolute path |
+| `--upstream` | `$WAYLAND_DISPLAY` | the compositor socket |
+| `--mult` | `1.65` | distance multiplier, where one notch is 120 px at 1.0 |
+| `--tau-ms` | `70` | decay time constant: lower is snappier, higher glides longer |
+| `--tick-ms` | `4` | interval between steps while a scroll is running |
+| `--verbose` | off | log every notch and the end of every scroll |
+
+Then apply them:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user restart wheelproxy.service
+```
+
+Restarting the proxy closes every browser window connected through it, so quit the browser first.
+
+## Troubleshooting
+
+- `journalctl --user -u wheelproxy` shows connections opening and closing, with byte counts and the reason
+  for each close.
+- With `--verbose` it also logs each notch, e.g. `[wheel] pointer=44 v120=120 remaining=198.0`, and the end
+  of each scroll, e.g. `[wheel] settled pointer=44 steps=52 ms=208.0`. No `[wheel]` lines while you scroll
+  means the browser is not connected through the proxy.
+- To check a running browser, read its environment: `tr '\0' '\n' < /proc/<pid>/environ | grep WAYLAND`
+  should show `WAYLAND_DISPLAY=wayland-smooth`.
+
+## Uninstall
+
+```sh
+systemctl --user disable --now wheelproxy.service
+make uninstall
+rm ~/.local/share/applications/google-chrome.desktop
+```
+
+Remove the override of every other entry you installed too.
+
+## Limitations
+
+- If the proxy stops, every browser connected through it loses its display connection and closes.
+- `--disable-smooth-scrolling` also turns off the animation for keyboard scrolling such as arrow keys and
+  Page Down.
+- Only vertical wheel scrolling is smoothed. Horizontal wheel and tilt-wheel scrolling pass through as-is.
+- Mice in a high-resolution wheel mode send many small events per notch. Each one is added to the pending
+  distance like a notch. This mode has not been tested.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

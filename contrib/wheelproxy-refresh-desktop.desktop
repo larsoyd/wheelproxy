@@ -1,7 +1,0 @@
-[Desktop Entry]
-Type=Application
-Name=wheelproxy Chrome menu entry check
-Comment=Regenerates the Chrome menu entry override after google-chrome updates
-Exec=@BINDIR@/wheelproxy-refresh-desktop
-NoDisplay=true
-X-KDE-autostart-phase=2

@@ -398,6 +398,24 @@ class Slower(Proxy):
         self.assertGreater(last - sent, 0.15)
 
 
+class Defaults(Proxy):
+    args = []
+
+    def test_default_distance_and_curve(self):
+        sent = time.monotonic()
+        events = self.events_after(wheel_frame(120), seconds=1.5, quiet=0.3)
+        values = v120_values(events)
+        self.assertEqual(198, sum(values), "values=%r" % values)
+        times = [t for t, o, op, _ in events if o == POINTER and op == 9]
+        cum, half = 0, None
+        for t, v in zip(times, values):
+            cum += v
+            if half is None and cum >= 99:
+                half = t - sent
+        self.assertGreater(half, 0.035, "half=%.3f" % half)
+        self.assertLess(half, 0.075, "half=%.3f" % half)
+
+
 class MissingUpstream(Proxy):
     upstream_name = "wayland-gone"
 

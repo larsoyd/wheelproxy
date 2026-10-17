@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=wheelproxy menu entry check
+Comment=Regenerates browser menu entry overrides after package updates
+Exec=@BINDIR@/wheelproxy-desktop @ENTRIES@
+NoDisplay=true
+X-KDE-autostart-phase=2

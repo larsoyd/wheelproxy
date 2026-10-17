@@ -67,7 +67,7 @@ struct conn {
     struct conn *next;
 };
 
-static struct opts opt = {.mult = 1.0, .tau_ms = 45, .tick_ms = 4, .listen = "wayland-smooth"};
+static struct opts opt = {.mult = 1.65, .tau_ms = 70, .tick_ms = 4, .listen = "wayland-smooth"};
 static int epfd;
 static struct conn *conns;
 
