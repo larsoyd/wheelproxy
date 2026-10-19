@@ -1,5 +1,5 @@
 <p align="center">
-  <img src=".github/logo.png" alt="wheelproxy" width="800">
+  <img src=".github/logo.png" alt="wheelproxy" width="520">
 </p>
 
 <p align="center">
