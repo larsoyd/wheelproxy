@@ -1,6 +1,32 @@
-# wheelproxy
+<p align="center">
+  <img src=".github/logo.png" alt="wheelproxy" width="800">
+</p>
+
+<p align="center">
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/github/license/larsoyd/wheelproxy?style=flat-square&color=9db8ff"></a>
+  <img alt="Wayland" src="https://img.shields.io/badge/Wayland-native-67e8f9?style=flat-square&logo=wayland&logoColor=white">
+  <img alt="Written in C11" src="https://img.shields.io/badge/C11-no%20dependencies-a78bfa?style=flat-square&logo=c&logoColor=white">
+  <img alt="Chrome and Chromium" src="https://img.shields.io/badge/Chrome%20%C2%B7%20Chromium-tested-4285F4?style=flat-square&logo=googlechrome&logoColor=white">
+  <a href="#install-on-arch-linux"><img alt="Arch Linux PKGBUILD" src="https://img.shields.io/badge/Arch%20Linux-PKGBUILD-1793D1?style=flat-square&logo=archlinux&logoColor=white"></a>
+  <a href="https://github.com/larsoyd/wheelproxy/commits/master"><img alt="Last commit" src="https://img.shields.io/github/last-commit/larsoyd/wheelproxy?style=flat-square&color=9aa4cf"></a>
+</p>
+
+<p align="center">
+  <a href="#install-on-arch-linux"><b>Install</b></a> ·
+  <a href="#how-it-works"><b>How it works</b></a> ·
+  <a href="#tuning"><b>Tuning</b></a> ·
+  <a href="#troubleshooting"><b>Troubleshooting</b></a> ·
+  <a href="#limitations"><b>Limitations</b></a>
+</p>
+
+---
 
 Responsive, smooth mouse-wheel scrolling for Chromium-based browsers on Wayland.
+
+- **Snappy:** each notch covers half its distance in about 50 ms instead of a slow-starting 200 ms ease-in-out.
+- **No patching:** no browser rebuild and no `LD_PRELOAD`. The browser just connects to a different socket.
+- **Leaves the rest alone:** touchpad, horizontal scrolling and Ctrl/Alt/Super+wheel pass through unchanged.
+- **Fails safe:** if the proxy is not running, the launcher starts the browser normally.
 
 Chromium animates every mouse-wheel notch with a fixed ease-in-out curve that lasts about 200 ms and starts
 slowly: about 1.4 % of the distance is covered after one 60 Hz frame and 13 % after 50 ms. Scrolling feels
